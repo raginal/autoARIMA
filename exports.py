@@ -103,7 +103,7 @@ def _draw_forecast_chart(
         label=f"Actual (held-out, n={result.n_forecast})",
     )
 
-    palette = ["#d7191c", "#f4a261", "#7b2d8b", "#00bcd4"]
+    palette = ["#d7191c", "#f4a261", "#7b2d8b", "#00bcd4", "#2ca02c"]
     for m, color in zip(ranked, palette):
         is_best   = m["rank"] == 1
         star      = "★ " if is_best else ""
@@ -321,7 +321,7 @@ class BatchForecastExporter:
     Charts →  {prefix}_{var}_{timestamp}.png   (one per dependent variable)
     """
 
-    _ML_LABELS = ("RandomForest", "XGBoost")   # canonical ML model name prefixes
+    _ML_LABELS = ("RandomForest", "XGBoost", "Theta", "ETS")   # canonical ML model name prefixes
 
     def __init__(self, output_dir: str = ".", prefix: str = "batch_forecast") -> None:
         self.output_dir = Path(output_dir)

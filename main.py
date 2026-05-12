@@ -15,7 +15,7 @@ from typing import List, Optional
 import pandas as pd
 
 from exports import ForecastExporter
-from forecaster import ARIMAXForecaster, MLForecaster, rank_models
+from forecaster import ARIMAXForecaster, ETSForecaster, MLForecaster, ThetaForecaster, rank_models
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,6 +180,18 @@ def main() -> None:
             print("  Fix: pip install xgboost  (macOS: also run brew install libomp)")
         else:
             print(f"  XGBoost failed: {e}")
+
+    print("\n  Fitting Theta...")
+    try:
+        ml_results.append(ThetaForecaster(verbose=True).fit_and_forecast(y, n_forecast))
+    except Exception as e:
+        print(f"  Theta failed: {e}")
+
+    print("\n  Fitting ETS...")
+    try:
+        ml_results.append(ETSForecaster(verbose=True).fit_and_forecast(y, n_forecast))
+    except Exception as e:
+        print(f"  ETS failed: {e}")
 
     # ── Rank all models by RMSE ───────────────────────────────────────────────
     ranked = rank_models(result, ml_results)

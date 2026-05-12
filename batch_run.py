@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from exports import BatchForecastExporter, _ranked_models
-from forecaster import ARIMAXForecaster, ForecastResult, MLForecaster, MLResult
+from forecaster import ARIMAXForecaster, ETSForecaster, ForecastResult, MLForecaster, MLResult, ThetaForecaster
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +85,18 @@ def _run_one(
             print("  Fix: pip install xgboost  (macOS: also run brew install libomp)")
         else:
             print(f"  XGBoost failed: {e}")
+
+    print("\n  Fitting Theta...")
+    try:
+        ml_results.append(ThetaForecaster(verbose=True).fit_and_forecast(y, n_forecast))
+    except Exception as e:
+        print(f"  Theta failed: {e}")
+
+    print("\n  Fitting ETS...")
+    try:
+        ml_results.append(ETSForecaster(verbose=True).fit_and_forecast(y, n_forecast))
+    except Exception as e:
+        print(f"  ETS failed: {e}")
 
     return result, ml_results
 

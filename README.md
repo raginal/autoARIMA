@@ -52,7 +52,7 @@ The analyst is prompted for four choices; everything else is automatic.
 | 8 | Auto | Fit ARIMAX (auto p, d, q via AIC) on data[:-N] |
 | 9 | Auto | Forecast last N periods; compare to actuals |
 | 10 | Auto | Check model residuals |
-| 11 | Auto | Fit Random Forest and XGBoost; rank all three models by RMSE |
+| 11 | Auto | Fit Random Forest, XGBoost, Theta, and ETS; rank all five models by RMSE |
 | 12 | Auto | Export Excel workbook + PNG chart (best model first throughout) |
 
 ### Batch mode  (`batch_run.py`)
@@ -69,7 +69,7 @@ Edit the CONFIG block at the top of `batch_run.py`, then run it unattended.
 | `EXPORT_DIR` | Output directory (`None` → same folder as data file) |
 | `EXPORT_PREFIX` | Stem for output filenames (a timestamp is always appended) |
 
-Each variable in `DEPENDENT_VARS` is modelled in turn with the full ARIMAX + Random Forest + XGBoost pipeline. Results are consolidated into a single Excel workbook and one PNG chart per variable.
+Each variable in `DEPENDENT_VARS` is modelled in turn with the full ARIMAX + Random Forest + XGBoost + Theta + ETS pipeline. Results are consolidated into a single Excel workbook and one PNG chart per variable.
 
 ---
 
@@ -99,7 +99,7 @@ Line chart (300 DPI) showing training series, held-out actuals, all model foreca
 
 | Sheet | Contents |
 |---|---|
-| **Master Forecasts** | All variables combined; one row per forecast period; leading `variable` column identifies the dependent variable; columns: `actual`, `best_model`, `ARIMAX_forecast`, `ARIMAX_CI_lower`, `ARIMAX_CI_upper`, `RandomForest_forecast`, `XGBoost_forecast` |
+| **Master Forecasts** | All variables combined; one row per forecast period; leading `variable` column identifies the dependent variable; columns: `actual`, `best_model`, `ARIMAX_forecast`, `ARIMAX_CI_lower`, `ARIMAX_CI_upper`, `RandomForest_forecast`, `XGBoost_forecast`, `Theta_forecast`, `ETS_forecast` |
 | **Master Metrics** | All models for all variables; leading `variable` column; ranked by RMSE within each variable |
 | **FC — {var}** | Per-variable sheet: forecast table (top) + variables table (below, separated by two blank rows) listing the dependent variable and each selected exogenous variable with their transform method and detail |
 
@@ -116,7 +116,6 @@ One chart per dependent variable — same layout as interactive mode.
 | Assumption | Test | Remediation |
 |---|---|---|
 | Stationarity | ADF + KPSS | log → Box-Cox → sqrt → first-difference → pct-change; discard if unsolvable |
-| Approximate normality | Jarque-Bera | same transform sequence |
 | Linearity of y ~ x | Harvey-Collier (on first-differenced series) | warning only; ML models capture non-linear effects |
 | No multicollinearity | VIF < 10 | iteratively remove highest-VIF variable |
 | Correlation with target | \|r\| ≥ 0.10 | discard exogenous candidate |
@@ -137,7 +136,7 @@ autoARIMA/
 ├── main.py          # interactive entry point + analyst UI
 ├── batch_run.py     # batch runner — CONFIG block, unattended multi-variable run
 ├── forecaster.py    # AssumptionChecker, VariableSelector,
-│                    # ARIMAXForecaster, MLForecaster
+│                    # ARIMAXForecaster, MLForecaster, ThetaForecaster, ETSForecaster
 ├── exports.py       # ForecastExporter (single-run), BatchForecastExporter (batch)
 ├── sample_data.xlsx # 52-quarter example dataset (3 dep vars, 4 exog)
 ├── requirements.txt
@@ -162,6 +161,14 @@ autoARIMA/
 ---
 
 ## Changelog
+
+### 2026-05-12 — v1.5
+- **ETS model added** — `ETSForecaster` in `forecaster.py`; uses Holt-Winters `ExponentialSmoothing`; auto-selects seasonal period (4 for quarterly, 12 for monthly) from a DatetimeIndex with enough observations; falls back to trend-only then simple exponential smoothing; runs in both interactive and batch modes; appears in all exports and rankings
+
+### 2026-05-12 — v1.4
+- **Theta model added** — `ThetaForecaster` in `forecaster.py`; runs alongside RF and XGBoost in both interactive and batch modes; univariate (no exog required); appears in all exports and rankings
+- **Pre-model normality requirement removed** — `AssumptionChecker._passes` now checks stationarity only; `is_normal` is retained for reference but not applied to input transforms. ARIMAX does not require normally distributed inputs — only residuals matter. This prevents unnecessary over-differencing that caused flat forecasts on many series
+- **XGBoost/RF improvement** — `MLForecaster._build_feature_matrix` now includes a `t_index` (monotonic integer position) feature so tree models can learn long-term trends that short lag windows cannot capture alone
 
 ### 2026-04-27 — v1.3
 - **`batch_run.py`** — new batch runner: edit a CONFIG block, run unattended across any number of dependent variables

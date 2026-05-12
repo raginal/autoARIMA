@@ -111,7 +111,7 @@ class AssumptionChecker:
             return True
 
     def _passes(self, s: pd.Series) -> bool:
-        return self.is_stationary(s) and self.is_normal(s)
+        return self.is_stationary(s)
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -417,7 +417,7 @@ class ARIMAXForecaster:
         self.dep_transform_ = dep_info
 
         # ── 2. Exogenous candidates ───────────────────────────────────────────
-        print("\n[2/5] Checking exogenous variable assumptions (stationarity, normality, linearity)...")
+        print("\n[2/5] Checking exogenous variable assumptions (stationarity, linearity)...")
         valid: Dict[str, Tuple[pd.Series, TransformInfo]] = {}
         for col in X.columns:
             try:
@@ -569,6 +569,7 @@ class MLForecaster:
         n_lags: int,
     ) -> pd.DataFrame:
         df = pd.DataFrame({"y": y.values})
+        df["t_index"] = np.arange(len(df))  # monotonic time position; gives tree models trend awareness
         for i in range(1, n_lags + 1):
             df[f"lag_{i}"] = df["y"].shift(i)
         if exog is not None and not exog.empty:
@@ -628,6 +629,178 @@ class MLForecaster:
         return MLResult(
             method   = label,
             forecast = pd.Series(preds,   index=idx, name=f"{label}_forecast"),
+            actuals  = pd.Series(actuals, index=idx, name="actuals"),
+            mae      = mae,
+            rmse     = rmse,
+            mape     = mape,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ETS (Exponential Smoothing) forecaster
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ETSForecaster:
+    """
+    Holt-Winters Exponential Smoothing (ETS) forecaster. Univariate only.
+
+    Auto-selects additive trend; attempts additive seasonality when the series
+    index has a detectable quarterly/monthly frequency and enough observations
+    (≥ 2 full cycles). Falls back to simpler configurations if fitting fails.
+    """
+
+    def __init__(self, verbose: bool = True) -> None:
+        self.verbose = verbose
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"  {msg}")
+
+    @staticmethod
+    def _detect_period(index) -> Optional[int]:
+        """Return seasonal period inferred from a DatetimeIndex, or None."""
+        if not isinstance(index, pd.DatetimeIndex):
+            return None
+        freq = getattr(index, "freq", None)
+        if freq is None:
+            try:
+                freq = pd.infer_freq(index)
+            except Exception:
+                return None
+        if freq is None:
+            return None
+        fs = str(freq).upper()
+        if any(q in fs for q in ("Q", "QS", "QE")):
+            return 4
+        if any(m in fs for m in ("MS", "ME", "BMS", "BM")):
+            return 12
+        if fs.startswith("M"):
+            return 12
+        if "W" in fs:
+            return 52
+        return None
+
+    def fit_and_forecast(
+        self,
+        y: pd.Series,
+        n_forecast: int,
+    ) -> MLResult:
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+        y_train = y.iloc[:-n_forecast]
+        actuals = y.values[-n_forecast:]
+
+        period     = self._detect_period(y_train.index)
+        use_season = period is not None and len(y_train) >= 2 * period
+
+        # Try configurations from richest to simplest
+        configs = []
+        if use_season:
+            configs.append({"trend": "add", "seasonal": "add", "seasonal_periods": period})
+        configs.append({"trend": "add", "seasonal": None, "seasonal_periods": None})
+        configs.append({"trend": None,  "seasonal": None, "seasonal_periods": None})
+
+        fit    = None
+        chosen = None
+        for cfg in configs:
+            try:
+                model = ExponentialSmoothing(
+                    y_train.values.astype(float),
+                    trend             = cfg["trend"],
+                    seasonal          = cfg["seasonal"],
+                    seasonal_periods  = cfg["seasonal_periods"],
+                    initialization_method = "estimated",
+                )
+                fit    = model.fit(optimized=True)
+                chosen = cfg
+                break
+            except Exception:
+                continue
+
+        if fit is None:
+            raise ValueError("ETS fitting failed under all configurations")
+
+        cfg_label = (
+            f"trend={chosen['trend']}, seasonal={chosen['seasonal']}"
+            + (f" period={chosen['seasonal_periods']}" if chosen["seasonal_periods"] else "")
+        )
+        self._log(f"ETS config: {cfg_label}")
+
+        preds = np.asarray(fit.forecast(n_forecast))
+
+        mae  = mean_absolute_error(actuals, preds)
+        rmse = float(np.sqrt(mean_squared_error(actuals, preds)))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mape = float(
+                np.mean(
+                    np.abs(np.where(actuals != 0, (actuals - preds) / actuals, 0.0))
+                ) * 100
+            )
+
+        self._log(f"ETS: MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
+
+        idx = y.index[-n_forecast:]
+        return MLResult(
+            method   = "ETS",
+            forecast = pd.Series(preds, index=idx, name="ETS_forecast"),
+            actuals  = pd.Series(actuals, index=idx, name="actuals"),
+            mae      = mae,
+            rmse     = rmse,
+            mape     = mape,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Theta forecaster
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ThetaForecaster:
+    """
+    Theta method — a weighted combination of two 'theta lines' derived from
+    simple exponential smoothing. Univariate only (ignores exog).
+
+    Uses statsmodels.tsa.forecasting.theta.ThetaModel with deseasonalize=False
+    so it works on any series regardless of frequency or index type.
+    """
+
+    def __init__(self, verbose: bool = True) -> None:
+        self.verbose = verbose
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"  {msg}")
+
+    def fit_and_forecast(
+        self,
+        y: pd.Series,
+        n_forecast: int,
+    ) -> MLResult:
+        from statsmodels.tsa.forecasting.theta import ThetaModel
+
+        y_train = y.iloc[:-n_forecast]
+        actuals = y.values[-n_forecast:]
+
+        # Reset to integer index so ThetaModel doesn't need a DatetimeIndex
+        y_vals = pd.Series(y_train.values, dtype=float)
+        tm  = ThetaModel(y_vals, deseasonalize=False)
+        fit = tm.fit(disp=False)
+        preds = np.asarray(fit.forecast(n_forecast))
+
+        mae  = mean_absolute_error(actuals, preds)
+        rmse = float(np.sqrt(mean_squared_error(actuals, preds)))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mape = float(
+                np.mean(
+                    np.abs(np.where(actuals != 0, (actuals - preds) / actuals, 0.0))
+                ) * 100
+            )
+
+        self._log(f"Theta: MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
+
+        idx = y.index[-n_forecast:]
+        return MLResult(
+            method   = "Theta",
+            forecast = pd.Series(preds, index=idx, name="Theta_forecast"),
             actuals  = pd.Series(actuals, index=idx, name="actuals"),
             mae      = mae,
             rmse     = rmse,
