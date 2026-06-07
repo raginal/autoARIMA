@@ -1,7 +1,14 @@
 # autoARIMA
 
-Local ARIMAX time-series forecaster with automatic variable selection,
-assumption checking, and optional ML comparison.
+Local, multi-model time-series forecaster. Runs a roster of models
+(SARIMAX with exogenous regressors, Random Forest, XGBoost, ElasticNet, Theta,
+ETS, a seasonal-naive baseline, and an ensemble), ranks them by an **honest
+rolling-origin backtest**, and exports forecasts, metrics, diagnostics and charts.
+
+Built for *difficult* series: short histories, possible non-linearity/non-normality,
+late-starting exogenous variables, and — importantly — the case where the **most
+recent reported values are unreliable** (e.g. reporting lags). Those recent values
+are forecast as the deliverable but are **never used to choose the model**.
 
 ---
 
@@ -9,10 +16,9 @@ assumption checking, and optional ML comparison.
 
 ```bash
 pip install -r requirements.txt
-pip install xgboost          # required for XGBoost comparison
 ```
 
-macOS also needs OpenMP for XGBoost:
+macOS also needs OpenMP for XGBoost (optional — the pipeline skips XGBoost gracefully if absent):
 
 ```bash
 brew install libomp
@@ -30,102 +36,144 @@ python3 main.py
 python3 batch_run.py
 ```
 
-Tested on Python 3.13.5.
+---
+
+## How model selection works (read this)
+
+The system separates two jobs that are usually conflated:
+
+1. **Selection / ranking** — every model is scored by a **rolling-origin backtest
+   over the *settled* history** (the periods you trust). Folds train on an expanding
+   window and forecast `N_FORECAST` steps ahead; errors are pooled and summarised by
+   **MASE** (Mean Absolute Scaled Error). MASE is scale-free, so it is comparable
+   across dependent variables, and `MASE ≥ 1` means a model is **no better than the
+   seasonal-naive baseline** (surfaced in the output).
+
+2. **Deliverable forecast** — each model refits on all settled data and forecasts the
+   most recent `N_FORECAST` periods. Their reported "actuals" are shown for reference
+   but flagged **UNRELIABLE** and excluded from ranking.
+
+This is the fix for the common failure mode where a model looks "best" only because it
+reproduces under-reported recent values.
 
 ---
 
 ## Workflow
 
-### Interactive mode  (`main.py`)
-
-The analyst is prompted for four choices; everything else is automatic.
+### Interactive mode (`main.py`)
 
 | Step | Who | What |
 |---|---|---|
 | 1 | Analyst | Select data file (`.xlsx`, `.xls`, `.csv`) |
 | 2 | Analyst | Select time variable |
 | 3 | Analyst | Select dependent (target) variable |
-| 4 | Analyst | Select N — number of periods to forecast |
-| 5 | Auto | Check + transform dependent variable |
-| 6 | Auto | Check + transform each exogenous candidate |
-| 7 | Auto | Select best exogenous via correlation & VIF |
-| 8 | Auto | Fit ARIMAX (auto p, d, q via AIC) on data[:-N] |
-| 9 | Auto | Forecast last N periods; compare to actuals |
-| 10 | Auto | Check model residuals |
-| 11 | Auto | Fit Random Forest, XGBoost, Theta, and ETS; rank all five models by RMSE |
-| 12 | Auto | Export Excel workbook + PNG chart (best model first throughout) |
+| 4 | Analyst | Select N — periods to forecast (the recent, possibly-unreliable tail) |
+| 5 | Analyst | Select number of backtest folds for ranking (press Enter for the default, 3) |
+| 6 | Auto | Detect seasonal period; select exogenous variables (once, on settled training) |
+| 7 | Auto | For each model: deliverable forecast + rolling-origin backtest |
+| 8 | Auto | Build the inverse-error ensemble; rank by backtest MASE; flag implausible moves |
+| 9 | Auto | Export Excel workbook + PNG chart (best model first throughout) |
 
-### Batch mode  (`batch_run.py`)
+The forecast horizon (N) and the fold count are never hardcoded: the horizon is the `N`
+you enter here (or `N_FORECAST` in batch mode) and the fold count is this prompt (or
+`N_BACKTEST_FOLDS` in batch mode).
 
-Edit the CONFIG block at the top of `batch_run.py`, then run it unattended.
+### Batch mode (`batch_run.py`)
+
+Edit the CONFIG block, then run unattended.
 
 | Setting | Description |
 |---|---|
 | `DATA_FILE` | Path to your `.xlsx`, `.xls`, or `.csv` file |
 | `SHEET_NAME` | Excel sheet name (or `None` for the first sheet) |
 | `TIME_COL` | Column name used as the time index |
-| `DEPENDENT_VARS` | List of columns to model — each is the dependent variable for one run; all are excluded from the exogenous candidate pool for every run |
-| `N_FORECAST` | Periods to hold out and forecast (shared across all variables) |
+| `DEPENDENT_VARS` | List of columns to model — each is modelled in turn; all are excluded from the exogenous pool for every run |
+| `N_FORECAST` | Number of most-recent periods to forecast (the unreliable tail) |
+| `N_BACKTEST_FOLDS` | Rolling-origin folds used for ranking (default 3) |
 | `EXPORT_DIR` | Output directory (`None` → same folder as data file) |
-| `EXPORT_PREFIX` | Stem for output filenames (a timestamp is always appended) |
+| `EXPORT_PREFIX` | Stem for output filenames |
 
-Each variable in `DEPENDENT_VARS` is modelled in turn with the full ARIMAX + Random Forest + XGBoost + Theta + ETS pipeline. Results are consolidated into a single Excel workbook and one PNG chart per variable.
+---
+
+## Models
+
+The roster lives in **one place** — `build_models()` in `forecaster.py`. Add or remove
+a single line there to change which models run; the orchestrators, backtester, exports
+and charts pick up the change automatically. Every model implements the same
+`fit_predict(y_train, X_train, X_future, h)` interface.
+
+| Model | Exog? | Notes |
+|---|---|---|
+| **SeasonalNaive** | no | Reference baseline and the MASE denominator. |
+| **ARIMAX (SARIMAX)** | yes | Auto `(p,d,q)(P,D,Q)` via AICc; seasonal when a period is detected; exogenous regressors via the correct `X=` keyword; exog kept in levels. |
+| **RandomForest** | yes | Lag + exog features, recursive multi-step. |
+| **XGBoost** | yes | As above (optional dependency). |
+| **ElasticNet** | yes | Standardised lags + exog + time index; linear, so it can extrapolate a trend and is robust to many exog. |
+| **Theta** | no | `ThetaModel`, deseasonalised when a period is present. |
+| **ETS** | no | Holt-Winters; **damped** trend included and AICc-selected so the trend cannot run away. |
+| **Ensemble** | — | Inverse-MASE weighted combination of the strongest models. |
 
 ---
 
 ## Outputs
 
+Charts have **stable filenames (no timestamp)**, so a re-run overwrites the previous
+chart of the same name. Excel files keep a timestamp so history is preserved.
+
 ### Interactive mode (`main.py`)
 
-Both files are saved to the same directory as the source data file.
+- **`Estimates {dep} YYYY-MM-DD HH-MM-SS.xlsx`**
 
-#### `Estimates YYYY-MM-DD HH-MM-SS.xlsx`
+  | Sheet | Contents |
+  |---|---|
+  | **Forecasts** | Period, reported actual (UNRELIABLE), every model's forecast (★ = best, ⚠ = flagged), best model's 95% CI, and a per-period flag column |
+  | **Metrics** | Rank, MASE, sMAPE, RMSE, MAE, MAPE, ARIMA order, AIC, "Beats naive", "Flagged" — sorted by MASE |
+  | **Diagnostics** | Seasonal period, selected exogenous, ranking basis, and ARIMAX residual diagnostics (Ljung-Box, Shapiro-Wilk, ARCH) |
 
-| Sheet | Contents |
-|---|---|
-| **Forecasts** | Period, actual, then all model forecasts sorted best-first (★ = best fit) |
-| **Metrics** | Rank, MAE, RMSE, MAPE, AIC — sorted by RMSE ascending |
-| **Variables** | Dependent + exogenous variables with transforms applied |
-
-#### `Estimates YYYY-MM-DD HH-MM-SS.png`
-
-Line chart (300 DPI) showing training series, held-out actuals, all model forecasts (best solid + ★, others dashed), and ARIMAX 95% CI.
-
----
+- **`Estimates {dep}.png`** — line chart (300 DPI): settled history, reported-but-unreliable tail (dashed grey), every model's forecast (best solid + ★), and the best model's 95% CI.
 
 ### Batch mode (`batch_run.py`)
 
-#### `{EXPORT_PREFIX}_{timestamp}.xlsx`
+- **`{EXPORT_PREFIX}_{timestamp}.xlsx`**
 
-| Sheet | Contents |
-|---|---|
-| **Master Forecasts** | All variables combined; one row per forecast period; leading `variable` column identifies the dependent variable; columns: `actual`, `best_model`, `ARIMAX_forecast`, `ARIMAX_CI_lower`, `ARIMAX_CI_upper`, `RandomForest_forecast`, `XGBoost_forecast`, `Theta_forecast`, `ETS_forecast` |
-| **Master Metrics** | All models for all variables; leading `variable` column; ranked by RMSE within each variable |
-| **FC — {var}** | Per-variable sheet: forecast table (top) + variables table (below, separated by two blank rows) listing the dependent variable and each selected exogenous variable with their transform method and detail |
+  | Sheet | Contents |
+  |---|---|
+  | **Master Forecasts** | All variables; one row per forecast period; `variable`, `reported_actual_UNRELIABLE`, `best_model`, `best_forecast`, `flag`, and a column per model |
+  | **Master Metrics** | All models for all variables; leading `variable` column; ranked by MASE within each variable |
+  | **FC — {var}** | Per-variable forecast table (top) + diagnostics table (below) |
 
-#### `{EXPORT_PREFIX}_{var}_{timestamp}.png`
-
-One chart per dependent variable — same layout as interactive mode.
+- **`{EXPORT_PREFIX}_{var}.png`** — one chart per dependent variable (stable name).
 
 ---
 
-## Statistical assumptions enforced
+## Statistical assumptions & robustness
 
-### Dependent & exogenous variables
+The dependent variable is **not** pre-differenced — SARIMAX selects its own
+integration orders `(d, D)`. The checker only applies a **variance-stabilizing**
+transform when warranted.
 
-| Assumption | Test | Remediation |
-|---|---|---|
-| Stationarity | ADF + KPSS | log → Box-Cox → sqrt → first-difference → pct-change; discard if unsolvable |
-| Linearity of y ~ x | Harvey-Collier (on first-differenced series) | warning only; ML models capture non-linear effects |
-| No multicollinearity | VIF < 10 | iteratively remove highest-VIF variable |
-| Correlation with target | \|r\| ≥ 0.10 | discard exogenous candidate |
-
-### Model residuals (warnings, not hard stops)
-
-| Check | Test |
+| Concern | Test / handling |
 |---|---|
-| Residual normality | Jarque-Bera |
-| No residual autocorrelation | Ljung-Box |
+| Variance stabilization (dependent var) | Box-Cox MLE λ → none / log / Box-Cox (inverse is domain-guarded, never `NaN`) |
+| Exogenous relevance | **Spearman** rank correlation (catches monotonic non-linearity; invariant to a monotone transform of y) |
+| Too many regressors | Cap at ≈ n/10 strongest by \|correlation\| |
+| Multicollinearity | VIF > 10 pruned **with an intercept** |
+| Late-starting exog | Dropped if coverage < 80% or missing over the forecast horizon; otherwise the shared leading-NaN region is trimmed |
+| Non-linearity / non-normality | Tree, ElasticNet and ensemble models capture non-linear effects; ranking is distribution-free (MASE on out-of-sample folds) |
+
+### Residual diagnostics (post-fit, reported in the Excel **Diagnostics** sheet)
+
+| Check | Test | Correctness note |
+|---|---|---|
+| Autocorrelation | Ljung-Box | uses the `model_df = p+q+P+Q` correction; transient residuals trimmed |
+| Normality | Shapiro-Wilk | reliable at small sample sizes |
+| Heteroskedasticity | Engle's ARCH | flags non-constant residual variance (CI validity) |
+
+### Forecast guardrails
+
+Models are damped/robust so trends cannot run away, and each forecast step is **flagged**
+(⚠) — never silently altered — when it jumps more than 3× the largest historical one-step
+move or leaves the historical range by more than half its span.
 
 ---
 
@@ -135,8 +183,10 @@ One chart per dependent variable — same layout as interactive mode.
 autoARIMA/
 ├── main.py          # interactive entry point + analyst UI
 ├── batch_run.py     # batch runner — CONFIG block, unattended multi-variable run
-├── forecaster.py    # AssumptionChecker, VariableSelector,
-│                    # ARIMAXForecaster, MLForecaster, ThetaForecaster, ETSForecaster
+├── forecaster.py    # model interface (Forecast/BaseForecaster), AssumptionChecker,
+│                    # VariableSelector, all model classes, detect_period(), build_models()
+├── evaluation.py    # rolling_backtest, metrics (MASE/sMAPE/…), build_ensemble,
+│                    # flag_implausible, rank_models, evaluate_variable, result structures
 ├── exports.py       # ForecastExporter (single-run), BatchForecastExporter (batch)
 ├── sample_data.xlsx # 52-quarter example dataset (3 dep vars, 4 exog)
 ├── requirements.txt
@@ -149,50 +199,46 @@ autoARIMA/
 ## Notes & limitations
 
 - **All processing is local** — no data leaves your machine.
-- Exogenous variables for the forecast period are taken from the dataset
-  (the held-out actuals). This is consistent with nowcasting / backtesting
-  but means you need those values in the file.
-- `auto_arima` tests up to ARIMA(5,2,5). Increase `max_p`/`max_q` in
-  `forecaster.py` if your series requires higher orders (at the cost of speed).
-- If ARIMAX fitting fails with exogenous variables, the model automatically
-  falls back to pure ARIMA.
-- XGBoost requires `pip install xgboost`. macOS also needs `brew install libomp`. If unavailable, the pipeline runs with ARIMAX + RandomForest only.
+- Exogenous values for the forecast horizon are read from the dataset, so those values
+  must be present in the file (they typically are, even when the target is lagged).
+- `auto_arima` searches up to ARIMA(5,2,5)(2,1,2). Adjust `max_*` in `forecaster.py`
+  if needed (at the cost of speed). The selected order is searched once per variable and
+  refit across backtest folds to keep large batches fast.
+- XGBoost requires `pip install xgboost` (+ `brew install libomp` on macOS). If
+  unavailable it is skipped and the remaining models still run.
 
 ---
 
 ## Changelog
 
+### 2026-06-07 — v2.0
+- **Critical fix:** ARIMAX now passes exogenous regressors via the correct `X=` keyword
+  (pmdarima ≥ 2.0). Previously `exogenous=` was silently dropped, so ARIMAX ran as a
+  pure ARIMA — producing flat, mean-reverting forecasts unresponsive to exog changes.
+- **Backtest-based selection:** models are ranked by a rolling-origin backtest over the
+  settled history (MASE), not by error against the recent, possibly-unreliable actuals.
+- **Common model interface** (`fit_predict`) + a single `build_models()` registry — add or
+  remove a model in one line. New `evaluation.py` centralizes backtesting, metrics,
+  ensembling and guardrails.
+- **New models:** seasonal-naive baseline, ElasticNet lag model, and an inverse-error
+  **ensemble**. ETS now uses a **damped** trend (AICc-selected); Theta deseasonalizes.
+- **Exogenous selection rebuilt:** Spearman correlation, regressor cap (~n/10), VIF with an
+  intercept, and explicit late-starting-exog handling (coverage + horizon checks + trim).
+- **Assumption checks corrected:** dependent variable no longer pre-differenced (SARIMAX
+  picks `d`/`D`); Box-Cox inverse domain-guarded; Ljung-Box uses the `model_df` correction;
+  Shapiro-Wilk replaces Jarque-Bera; ARCH heteroskedasticity test added; all residual
+  diagnostics are now exported, not just printed.
+- **Guardrails:** implausible forecast jumps are flagged (⚠) in console, Excel and charts.
+- **Stable chart filenames** (no timestamp) so names stay constant across runs.
+
 ### 2026-05-12 — v1.5
-- **ETS model added** — `ETSForecaster` in `forecaster.py`; uses Holt-Winters `ExponentialSmoothing`; auto-selects seasonal period (4 for quarterly, 12 for monthly) from a DatetimeIndex with enough observations; falls back to trend-only then simple exponential smoothing; runs in both interactive and batch modes; appears in all exports and rankings
+- ETS model added (`ETSForecaster`).
 
 ### 2026-05-12 — v1.4
-- **Theta model added** — `ThetaForecaster` in `forecaster.py`; runs alongside RF and XGBoost in both interactive and batch modes; univariate (no exog required); appears in all exports and rankings
-- **Pre-model normality requirement removed** — `AssumptionChecker._passes` now checks stationarity only; `is_normal` is retained for reference but not applied to input transforms. ARIMAX does not require normally distributed inputs — only residuals matter. This prevents unnecessary over-differencing that caused flat forecasts on many series
-- **XGBoost/RF improvement** — `MLForecaster._build_feature_matrix` now includes a `t_index` (monotonic integer position) feature so tree models can learn long-term trends that short lag windows cannot capture alone
+- Theta model added; pre-model normality requirement removed; `t_index` added to ML features.
 
 ### 2026-04-27 — v1.3
-- **`batch_run.py`** — new batch runner: edit a CONFIG block, run unattended across any number of dependent variables
-- All listed dependent variables automatically excluded from each other's exogenous candidate pool (no cross-contamination)
-- **`exports.py`** — added `BatchForecastExporter`: Master Forecasts + Master Metrics sheets (with leading `variable` column) plus per-variable Forecasts sheets and one PNG per variable
-- Stationarity transform cascade extended: first-difference and percentage-growth-rate transforms added after log / Box-Cox / sqrt; each recovers to original level scale before evaluation
-- Added `sample_data.xlsx` — 52-quarter example dataset (3 dependent variables, 4 exogenous candidates) for immediate use with `batch_run.py`
-- Per-variable sheets in batch output now include a variables table (below the forecast table) showing each selected exogenous variable with its transform method and detail; single-run Variables sheet upgraded to the same format
+- `batch_run.py` added; per-variable sheets; sample dataset.
 
-### 2026-04-26 — v1.1
-- All three models (ARIMAX, RandomForest, XGBoost) always run; ranked by RMSE
-- Best-fit model (★) shown first in both the Forecasts sheet columns and Metrics rows
-- Added Harvey-Collier linearity test per exogenous variable (first-differenced to avoid false positives on autocorrelated series)
-- Robustified KPSS nlags to avoid failures on very short series (Python 3.13.5 compatible)
-- XGBoost errors (including missing libomp on macOS) handled gracefully with install instructions
-- Removed analyst prompt for ML comparison — all models always run
-
-### 2026-04-26 — v1.0
-- Three-file architecture: `main.py`, `forecaster.py`, `exports.py`
-- Analyst-driven UI: file, time column, dependent column, N selection
-- Automatic stationarity + normality testing with log / Box-Cox / sqrt transforms
-- Exogenous variable selection: Pearson correlation filter + iterative VIF pruning
-- `pmdarima.auto_arima` for ARIMA order selection
-- Residual diagnostics: Jarque-Bera + Ljung-Box
-- Accuracy reporting: MAE, RMSE, MAPE
-- Excel export with Forecasts, Metrics, Variables sheets
-- PNG chart (300 DPI) with confidence interval
+### 2026-04-26 — v1.0–v1.1
+- Initial three-file architecture, analyst UI, ARIMAX + RF + XGBoost, Excel/PNG export.

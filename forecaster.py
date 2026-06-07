@@ -1,25 +1,80 @@
 """
 forecaster.py
-Core forecasting logic: assumption checking, variable selection,
-ARIMAX modelling, and ML comparison (Random Forest + XGBoost).
+Core forecasting logic.
+
+Public surface
+──────────────
+- Forecast            : uniform model output (numpy point forecast + optional CI + meta dict)
+- BaseForecaster      : common ``fit_predict(y_train, X_train, X_future, h)`` interface
+- AssumptionChecker   : dependent-variable variance-stabilizing transforms + residual diagnostics
+- VariableSelector    : Spearman correlation + VIF exogenous selection (late-start aware)
+- Model classes       : SeasonalNaive, ARIMAXForecaster, RandomForestForecaster,
+                        XGBoostForecaster, ThetaForecaster, ETSForecaster, LinearLagForecaster
+- detect_period()     : seasonal period from a DatetimeIndex (quarterly→4, monthly→12, weekly→52)
+- build_models()      : registry factory → list of model instances.
+                        Add / remove ONE line here to change the model roster.
+
+Design
+──────
+Every model exposes the same ``fit_predict`` so a single rolling-origin backtester
+(see ``evaluation.py``) can evaluate any of them, and the same call produces the final
+deliverable forecast. Models return plain numpy arrays; the orchestrator attaches the
+pandas index. No model holds the held-out split — that lives in the orchestrator.
 """
 
 from __future__ import annotations
 
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import pmdarima as pm
 from scipy import stats
 from scipy.special import inv_boxcox
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tools.tools import add_constant
 from statsmodels.tsa.stattools import adfuller, kpss
 
-warnings.filterwarnings("ignore")
+
+@contextmanager
+def _silence():
+    """Suppress noisy convergence / runtime warnings only around a fit call."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        yield
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Seasonal period detection (shared by several models)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_period(index) -> int:
+    """
+    Infer the seasonal period from a DatetimeIndex. Returns 1 (non-seasonal) when
+    the index is not datetime or no regular frequency can be inferred.
+    """
+    if not isinstance(index, pd.DatetimeIndex):
+        return 1
+    freq = getattr(index, "freq", None)
+    if freq is None:
+        try:
+            freq = pd.infer_freq(index)
+        except Exception:
+            freq = None
+    if freq is None:
+        return 1
+    fs = str(freq).upper()
+    if "Q" in fs:
+        return 4
+    if fs.startswith("M") or "ME" in fs or "MS" in fs or "BM" in fs:
+        return 12
+    if "W" in fs:
+        return 52
+    if fs.startswith("D"):
+        return 7
+    return 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -28,53 +83,37 @@ warnings.filterwarnings("ignore")
 
 @dataclass
 class TransformInfo:
-    method: str = "none"          # 'none' | 'log' | 'boxcox' | 'sqrt' | 'diff' | 'pct_change'
+    """Variance-stabilizing transform applied to the dependent variable only."""
+    method: str = "none"           # 'none' | 'log' | 'boxcox'
     lambda_: Optional[float] = None
-    shift: float = 0.0
-    anchor: float = 0.0           # last actual level (original scale) before forecast; used by diff / pct_change inverse transforms
+    shift: float = 0.0             # added before transform to make the series positive
 
 
 @dataclass
-class ForecastResult:
-    forecast:      pd.Series = field(default_factory=pd.Series)
-    ci_lower:      pd.Series = field(default_factory=pd.Series)
-    ci_upper:      pd.Series = field(default_factory=pd.Series)
-    actuals:       pd.Series = field(default_factory=pd.Series)
-    train_actuals: pd.Series = field(default_factory=pd.Series)
-    order:         Tuple     = (0, 0, 0)
-    aic:           float     = float("nan")
-    mae:           float     = float("nan")
-    rmse:          float     = float("nan")
-    mape:          float     = float("nan")
-    selected_exog:   List[str]              = field(default_factory=list)
-    exog_transforms: Dict[str, "TransformInfo"] = field(default_factory=dict)
-    dep_transform:   TransformInfo          = field(default_factory=TransformInfo)
-    n_forecast:      int                    = 0
-    model:           object                 = None
-
-
-@dataclass
-class MLResult:
-    method:   str        = ""
-    forecast: pd.Series  = field(default_factory=pd.Series)
-    actuals:  pd.Series  = field(default_factory=pd.Series)
-    mae:      float      = float("nan")
-    rmse:     float      = float("nan")
-    mape:     float      = float("nan")
+class Forecast:
+    """Uniform output of every model's ``fit_predict``."""
+    point:    np.ndarray
+    ci_lower: Optional[np.ndarray] = None
+    ci_upper: Optional[np.ndarray] = None
+    meta:     Dict = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Assumption checking and variable transformation
+# Assumption checking and dependent-variable transformation
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AssumptionChecker:
     """
-    Tests stationarity (ADF + KPSS) and normality (Jarque-Bera).
-    Applies log, Box-Cox, or sqrt transforms to satisfy assumptions.
-    Raises ValueError if a variable cannot be made stationary.
+    Handles the dependent variable's *variance-stabilizing* transform and the
+    post-fit residual diagnostics.
+
+    Stationarity / differencing is intentionally NOT done here — SARIMAX selects
+    its own (d, D) integration orders. Pre-differencing the target fought that
+    selection and required fragile inverse-cumsum machinery, so this class now
+    only applies log / Box-Cox to stabilize variance when it helps.
     """
 
-    MIN_OBS = 10   # minimum observations needed for reliable tests
+    MIN_OBS = 10
 
     def __init__(self, verbose: bool = True) -> None:
         self.verbose = verbose
@@ -83,220 +122,134 @@ class AssumptionChecker:
         if self.verbose:
             print(f"    {msg}")
 
-    # ── individual tests ─────────────────────────────────────────────────────
+    # ── stationarity test (informational / reused by VariableSelector) ─────────
 
     def is_stationary(self, s: pd.Series) -> bool:
-        """ADF rejects unit-root AND KPSS fails to reject stationarity."""
-        s = s.dropna()
+        """ADF rejects unit root AND KPSS fails to reject stationarity (trend-aware)."""
+        s = pd.Series(s).dropna()
         if len(s) < self.MIN_OBS:
             return True
         try:
-            adf_p = adfuller(s, autolag="AIC")[1]
-            # nlags="auto" can fail on very short series; cap explicitly
-            nlags = max(1, min(int(len(s) ** 0.5), len(s) // 5))
-            kpss_p = kpss(s, regression="c", nlags=nlags)[1]
+            with _silence():
+                adf_p = adfuller(s, autolag="AIC", regression="ct")[1]
+                nlags = max(1, min(int(len(s) ** 0.5), len(s) // 5))
+                kpss_p = kpss(s, regression="ct", nlags=nlags)[1]
             return adf_p < 0.05 and kpss_p > 0.05
         except Exception:
             return False
 
-    def is_normal(self, s: pd.Series) -> bool:
-        """Jarque-Bera test for normality (p > 0.05 → approximately normal)."""
-        s = s.dropna()
-        if len(s) < 8:
-            return True
-        try:
-            _, p = stats.jarque_bera(s)
-            return p > 0.05
-        except Exception:
-            return True
+    # ── dependent-variable transform ──────────────────────────────────────────
 
-    def _passes(self, s: pd.Series) -> bool:
-        return self.is_stationary(s)
-
-    # ── public API ────────────────────────────────────────────────────────────
-
-    def check_and_transform(
-        self, series: pd.Series, name: str
-    ) -> Tuple[pd.Series, TransformInfo]:
+    def choose_transform(self, series: pd.Series, name: str = "y") -> TransformInfo:
         """
-        Return (transformed_series, TransformInfo).
-        Raises ValueError if stationarity cannot be achieved.
+        Pick a variance-stabilizing transform via the Box-Cox MLE λ:
+          λ ≈ 1  → no transform   |  λ ≈ 0 → log   |  otherwise → Box-Cox(λ).
+        Falls back to 'none' on any failure. Never differences.
         """
-        info = TransformInfo()
-        s = series.copy().astype(float).replace([np.inf, -np.inf], np.nan)
+        s = pd.Series(series).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(s) < self.MIN_OBS:
+            return TransformInfo()
 
-        if s.isna().all():
-            raise ValueError("all values are null or infinite")
-
-        s_filled = s.ffill().bfill()
-
-        # ── no transform needed ───────────────────────────────────────────────
-        if self._passes(s_filled):
-            self._log(f"{name}: OK — no transform needed")
-            return s, info
-
-        # ── compute shift to make series strictly positive ───────────────────
-        min_val = float(s_filled.min())
-        shift   = max(0.0, -min_val + 1.0)
-
-        # ── log ───────────────────────────────────────────────────────────────
+        shift = 0.0
+        if (s <= 0).any():
+            shift = float(-s.min() + 1.0)
+        sp = s + shift
         try:
-            s_log = np.log(s_filled + shift)
-            if self._passes(s_log):
-                self._log(f"{name}: log transform applied (shift={shift:.4f})")
-                info.method = "log"
-                info.shift  = shift
-                return np.log(s + shift), info
+            with _silence():
+                lam = float(stats.boxcox_normmax(sp.values, method="mle"))
         except Exception:
-            pass
+            return TransformInfo()
 
-        # ── Box-Cox ───────────────────────────────────────────────────────────
-        try:
-            s_bc_arr, lam = stats.boxcox(s_filled + shift)
-            s_bc = pd.Series(s_bc_arr, index=s_filled.index)
-            if self._passes(s_bc):
-                self._log(
-                    f"{name}: Box-Cox transform applied (λ={lam:.4f}, shift={shift:.4f})"
-                )
-                info.method   = "boxcox"
-                info.lambda_  = lam
-                info.shift    = shift
-                return (
-                    pd.Series(
-                        stats.boxcox(s.fillna(s.median()) + shift, lmbda=lam),
-                        index=s.index,
-                    ).where(s.notna(), other=np.nan),
-                    info,
-                )
-        except Exception:
-            pass
+        lam = float(np.clip(lam, -1.0, 2.0))
+        if abs(lam - 1.0) < 0.30:
+            self._log(f"{name}: no transform (Box-Cox λ≈{lam:.2f})")
+            return TransformInfo(method="none")
+        if abs(lam) < 0.30:
+            self._log(f"{name}: log transform (Box-Cox λ≈{lam:.2f}, shift={shift:.4f})")
+            return TransformInfo(method="log", shift=shift)
+        self._log(f"{name}: Box-Cox transform (λ={lam:.4f}, shift={shift:.4f})")
+        return TransformInfo(method="boxcox", lambda_=lam, shift=shift)
 
-        # ── sqrt ──────────────────────────────────────────────────────────────
-        try:
-            s_sqrt = np.sqrt(s_filled + shift)
-            if self._passes(s_sqrt):
-                self._log(f"{name}: sqrt transform applied (shift={shift:.4f})")
-                info.method = "sqrt"
-                info.shift  = shift
-                return np.sqrt(s + shift), info
-        except Exception:
-            pass
+    def apply(self, series: pd.Series, info: TransformInfo) -> pd.Series:
+        s = pd.Series(series).astype(float)
+        if info.method == "log":
+            return np.log(s + info.shift)
+        if info.method == "boxcox":
+            with _silence():
+                vals = stats.boxcox(s.clip(lower=-info.shift + 1e-9) + info.shift, lmbda=info.lambda_)
+            return pd.Series(vals, index=s.index)
+        return s
 
-        # ── first difference ──────────────────────────────────────────────────
-        try:
-            s_diff = s_filled.diff()
-            if self._passes(s_diff.dropna()):
-                self._log(f"{name}: first-difference transform applied")
-                info.method = "diff"
-                return s.diff(), info
-        except Exception:
-            pass
-
-        # ── percentage growth rate ────────────────────────────────────────────
-        try:
-            s_pct = (s_filled + shift).pct_change() * 100
-            if self._passes(s_pct.dropna()):
-                self._log(
-                    f"{name}: percentage growth rate transform applied (shift={shift:.4f})"
-                )
-                info.method = "pct_change"
-                info.shift  = shift
-                return (s + shift).pct_change() * 100, info
-        except Exception:
-            pass
-
-        # ── stationary-only fallback (normality less critical for exog) ───────
-        if self.is_stationary(s_filled):
-            self._log(f"{name}: stationary but non-normal — kept without transform")
-            return s, info
-
-        raise ValueError(
-            f"'{name}' cannot be made stationary after log / Box-Cox / sqrt / diff / pct_change transforms"
-        )
-
-    def inverse_transform(
-        self, values: np.ndarray, info: TransformInfo
-    ) -> np.ndarray:
+    def inverse(self, values: np.ndarray, info: TransformInfo) -> np.ndarray:
         v = np.asarray(values, dtype=float)
         if info.method == "log":
-            return np.exp(v) - info.shift
+            return np.exp(np.clip(v, None, 700)) - info.shift
         if info.method == "boxcox":
-            return inv_boxcox(v, info.lambda_) - info.shift
-        if info.method == "sqrt":
-            return np.clip(v, 0, None) ** 2 - info.shift
-        if info.method == "diff":
-            # cumulative sum from the last known level restores the original scale
-            return np.cumsum(v) + info.anchor
-        if info.method == "pct_change":
-            # reconstruct levels: anchor_shifted * ∏(1 + pct_i/100) − shift
-            anchor_shifted = info.anchor + info.shift
-            return anchor_shifted * np.cumprod(1.0 + v / 100.0) - info.shift
-        return v  # 'none'
+            lam = info.lambda_
+            if lam == 0:
+                out = np.exp(np.clip(v, None, 700))
+            else:
+                # guard the domain: 1 + λv must be > 0, else inv_boxcox returns NaN
+                base = np.clip(1.0 + lam * v, 1e-9, None)
+                out = np.power(base, 1.0 / lam)
+            return out - info.shift
+        return v
 
-    def check_residuals(self, model: pm.ARIMA) -> None:
-        """Print residual diagnostic checks after model fitting."""
-        try:
-            from statsmodels.stats.diagnostic import acorr_ljungbox
-            resid = np.array(model.resid())
-            if len(resid) < 5:
-                return
-            _, norm_p = stats.jarque_bera(resid)
-            lags = min(10, max(1, len(resid) // 5))
-            lb_p = float(
-                acorr_ljungbox(resid, lags=[lags], return_df=True)[
-                    "lb_pvalue"
-                ].iloc[0]
-            )
-            self._log(
-                f"Residual normality   (Jarque-Bera): p={norm_p:.4f}"
-                + ("  ✓" if norm_p > 0.05 else "  ⚠ non-normal")
-            )
-            self._log(
-                f"Residual autocorr    (Ljung-Box):   p={lb_p:.4f}"
-                + ("  ✓" if lb_p > 0.05 else "  ⚠ autocorrelated")
-            )
-        except Exception as e:
-            self._log(f"Residual diagnostics skipped: {e}")
+    # ── residual diagnostics (post-fit) ─────────────────────────────────────────
 
-    def check_linearity(self, x: pd.Series, y: pd.Series, name: str) -> bool:
+    def residual_diagnostics(self, model, period: int = 1) -> Dict[str, object]:
         """
-        Harvey-Collier test for linearity of the y ~ x relationship.
-
-        Both series are first-differenced before the test to remove trend and
-        serial autocorrelation — raw time series would cause false positives
-        because OLS residuals inherit the autocorrelation of y.
-
-        A non-linear result is a WARNING only — the variable is kept because:
-          (a) transforms may already have linearised the relationship, and
-          (b) the ML models (RF/XGBoost) always run and capture non-linear effects.
-        Returns True if linear (or if the test cannot be run).
+        Statistically correct residual checks on a fitted pmdarima ARIMA model:
+          • Ljung-Box with the model_df (AR+MA params) correction,
+          • Shapiro-Wilk normality (reliable at small n, unlike Jarque-Bera),
+          • Engle's ARCH test for heteroskedasticity.
+        Initialization-transient residuals are trimmed and residuals standardized.
+        Returns a dict of p-values + human-readable notes (never raises).
         """
+        out: Dict[str, object] = {
+            "ljung_box_p": np.nan, "normality_p": np.nan, "arch_p": np.nan, "notes": ""
+        }
         try:
-            import statsmodels.api as sm
-            from statsmodels.stats.diagnostic import linear_harvey_collier
+            from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 
-            df = pd.DataFrame({"y": y.values, "x": x.values}).dropna()
-            df = df.diff().dropna()  # first-difference removes trend + autocorrelation
+            resid = np.asarray(model.resid(), dtype=float)
+            order = getattr(model, "order", (0, 0, 0))
+            sorder = getattr(model, "seasonal_order", (0, 0, 0, 0))
+            p, d, q = order
+            P, D, Q, m = (sorder + (0, 0, 0, 0))[:4]
 
-            if len(df) < 15:
-                self._log(f"{name}: linearity check skipped (< 15 obs after differencing)")
-                return True
+            trim = int(d + D * max(m, 1) + p + P * max(m, 1))
+            trim = max(0, min(trim, len(resid) // 4))
+            r = resid[trim:]
+            r = r[np.isfinite(r)]
+            if len(r) < 8:
+                out["notes"] = "too few residuals for diagnostics"
+                return out
+            sd = np.std(r)
+            r = (r - np.mean(r)) / sd if sd > 0 else r
 
-            X_sm = sm.add_constant(df["x"].values)
-            ols  = sm.OLS(df["y"].values, X_sm).fit()
-            _, p = linear_harvey_collier(ols)
+            model_df = int(p + q + P + Q)
+            lags = min(2 * period if period > 1 else 10, max(model_df + 2, len(r) // 5))
+            with _silence():
+                lb = acorr_ljungbox(r, lags=[lags], model_df=model_df, return_df=True)
+                out["ljung_box_p"] = float(lb["lb_pvalue"].iloc[0])
+                out["normality_p"] = float(stats.shapiro(r)[1]) if len(r) <= 5000 else np.nan
+                try:
+                    out["arch_p"] = float(het_arch(r, nlags=min(lags, len(r) // 5))[1])
+                except Exception:
+                    out["arch_p"] = np.nan
 
-            if p < 0.05:
-                self._log(
-                    f"{name}: ⚠ possible non-linearity (Harvey-Collier p={p:.4f})"
-                    " — ML models will also capture non-linear effects"
-                )
-                return False
-            self._log(f"{name}: linearity OK (Harvey-Collier p={p:.4f})")
-            return True
+            notes = []
+            if out["ljung_box_p"] < 0.05:
+                notes.append("residual autocorrelation")
+            if out["normality_p"] < 0.05:
+                notes.append("non-normal residuals")
+            if out["arch_p"] < 0.05:
+                notes.append("heteroskedasticity (ARCH)")
+            out["notes"] = "; ".join(notes) if notes else "OK"
         except Exception as e:
-            self._log(f"{name}: linearity check skipped ({e})")
-            return True
+            out["notes"] = f"diagnostics skipped ({e})"
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,8 +259,11 @@ class AssumptionChecker:
 class VariableSelector:
     """
     Selects exogenous regressors via:
-      1. Pearson correlation filter (|r| >= corr_threshold)
-      2. Iterative VIF pruning (removes highest-VIF variable until VIF < max_vif)
+      1. Coverage + future-availability filter (handles late-starting series),
+      2. Spearman (rank) correlation filter — catches monotonic non-linear links
+         that Pearson misses and is invariant to a monotone transform of y,
+      3. cap on the number of regressors (~n/10) to prevent over-parameterization,
+      4. iterative VIF pruning (with an intercept) to remove collinear regressors.
     """
 
     def __init__(self, verbose: bool = True) -> None:
@@ -321,534 +277,451 @@ class VariableSelector:
         self,
         y: pd.Series,
         X: pd.DataFrame,
-        corr_threshold: float = 0.10,
+        X_future: Optional[pd.DataFrame] = None,
+        corr_threshold: float = 0.30,
         max_vif: float = 10.0,
+        max_exog: Optional[int] = None,
+        min_coverage: float = 0.80,
     ) -> List[str]:
-        if X.empty:
+        if X is None or X.empty:
             return []
 
-        # ── Step 1: correlation filter ────────────────────────────────────────
-        keep: List[str] = []
+        n = len(y)
+        if max_exog is None:
+            max_exog = max(1, n // 10)
+
+        # ── Step 1+2: coverage, future-availability, Spearman correlation ──────
+        scored: List[Tuple[str, float]] = []
         for col in X.columns:
             try:
-                r = abs(float(y.corr(X[col])))
-                tag = "kept" if r >= corr_threshold else "dropped (low correlation)"
-                self._log(f"{col}: |corr|={r:.3f} → {tag}")
+                if X_future is not None and col in X_future.columns and X_future[col].isna().any():
+                    self._log(f"{col}: dropped — exog missing over the forecast horizon")
+                    continue
+                cov = float(X[col].notna().mean())
+                if cov < min_coverage:
+                    self._log(f"{col}: dropped — only {cov:.0%} coverage (< {min_coverage:.0%})")
+                    continue
+                pair = pd.concat([y, X[col]], axis=1).dropna()
+                if len(pair) < 5:
+                    continue
+                r = abs(float(stats.spearmanr(pair.iloc[:, 0], pair.iloc[:, 1]).statistic))
+                if not np.isfinite(r):
+                    continue
                 if r >= corr_threshold:
-                    keep.append(col)
+                    scored.append((col, r))
+                    self._log(f"{col}: |Spearman|={r:.3f} → candidate")
+                else:
+                    self._log(f"{col}: |Spearman|={r:.3f} → dropped (weak)")
             except Exception:
-                pass
+                continue
 
-        if not keep:
-            self._log("No variables exceed correlation threshold — using pure ARIMA")
+        if not scored:
+            self._log("No exogenous variable exceeds the correlation threshold — pure ARIMA")
             return []
 
-        # ── Step 2: VIF pruning ───────────────────────────────────────────────
-        selected = list(keep)
+        # ── Step 3: cap to the strongest max_exog by |correlation| ─────────────
+        scored.sort(key=lambda t: t[1], reverse=True)
+        if len(scored) > max_exog:
+            self._log(f"Capping exogenous count {len(scored)} → {max_exog} (sample size guard)")
+        selected = [c for c, _ in scored[:max_exog]]
+
+        # ── Step 4: VIF pruning with an intercept ──────────────────────────────
         while len(selected) > 1:
             sub = X[selected].dropna()
-            if len(sub) < 2:
+            if len(sub) <= len(selected) + 1:
                 break
             try:
-                vifs = [
-                    variance_inflation_factor(sub.values, i)
-                    for i in range(len(selected))
-                ]
+                with _silence():
+                    design = add_constant(sub.values, has_constant="add")
+                    # column 0 is the intercept; skip it when reading VIFs
+                    vifs = [variance_inflation_factor(design, i + 1) for i in range(len(selected))]
             except Exception:
                 break
             mx = max(vifs)
             if mx <= max_vif:
                 break
             drop_idx = vifs.index(mx)
-            self._log(
-                f"{selected[drop_idx]}: VIF={mx:.2f} > {max_vif} → dropped (multicollinearity)"
-            )
+            self._log(f"{selected[drop_idx]}: VIF={mx:.2f} > {max_vif} → dropped (collinear)")
             selected.pop(drop_idx)
 
-        self._log(f"Final exogenous selection: {selected}")
+        self._log(f"Final exogenous selection: {selected or 'none'}")
         return selected
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ARIMAX forecaster
+# Common model interface
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ARIMAXForecaster:
-    """
-    Full pipeline:
-      1. Transform dependent variable to satisfy ARIMA assumptions
-      2. Transform and validate each candidate exogenous variable
-      3. Select exogenous variables via correlation + VIF
-      4. Auto-select ARIMA(p,d,q) order via AIC
-      5. Forecast held-out N periods; evaluate accuracy
-      6. Run residual diagnostics
-    """
+class BaseForecaster:
+    """All models implement ``fit_predict`` and declare whether they use exog."""
+    name: str = "base"
+    uses_exog: bool = False
 
-    def __init__(self, verbose: bool = True) -> None:
-        self.verbose        = verbose
-        self.model_:        Optional[pm.ARIMA]          = None
-        self.dep_transform_: TransformInfo               = TransformInfo()
-        self.exog_transforms_: Dict[str, TransformInfo] = {}
-        self.selected_exog_: List[str]                  = []
-        self._checker  = AssumptionChecker(verbose)
-        self._selector = VariableSelector(verbose)
-
-    def _log(self, msg: str) -> None:
-        if self.verbose:
-            print(f"  {msg}")
-
-    def fit_and_forecast(
+    def fit_predict(
         self,
-        y: pd.Series,
-        X: pd.DataFrame,
-        n_forecast: int,
-    ) -> ForecastResult:
+        y_train: pd.Series,
+        X_train: Optional[pd.DataFrame],
+        X_future: Optional[pd.DataFrame],
+        h: int,
+    ) -> Forecast:
+        raise NotImplementedError
 
-        # ── 1. Dependent variable ─────────────────────────────────────────────
-        print("\n[1/5] Checking dependent variable assumptions...")
-        try:
-            y_t, dep_info = self._checker.check_and_transform(y, str(y.name or "y"))
-        except ValueError as e:
-            print(f"  WARNING: {e} — proceeding without transform")
-            y_t, dep_info = y.copy().astype(float), TransformInfo()
-        # diff / pct_change inverse transforms need the last training-period level
-        if dep_info.method in ("diff", "pct_change"):
-            dep_info.anchor = float(y.iloc[-(n_forecast + 1)])
-        self.dep_transform_ = dep_info
 
-        # ── 2. Exogenous candidates ───────────────────────────────────────────
-        print("\n[2/5] Checking exogenous variable assumptions (stationarity, linearity)...")
-        valid: Dict[str, Tuple[pd.Series, TransformInfo]] = {}
-        for col in X.columns:
-            try:
-                x_t, x_info = self._checker.check_and_transform(X[col], col)
-                # Linearity check uses training slice only (no look-ahead)
-                self._checker.check_linearity(
-                    x_t.iloc[:-n_forecast], y_t.iloc[:-n_forecast], col
-                )
-                valid[col] = (x_t, x_info)
-            except ValueError as e:
-                self._log(f"{col}: DROPPED — {e}")
-
-        X_t = (
-            pd.DataFrame({k: v[0] for k, v in valid.items()})
-            if valid
-            else pd.DataFrame(index=X.index)
-        )
-        self.exog_transforms_ = {k: v[1] for k, v in valid.items()}
-
-        # ── 3. Split train / test ─────────────────────────────────────────────
-        y_train_t = y_t.iloc[:-n_forecast]
-
-        # ── 4. Select exogenous (evaluated on training slice only) ────────────
-        print("\n[3/5] Selecting exogenous variables...")
-        if not X_t.empty:
-            self.selected_exog_ = self._selector.select(
-                y_train_t, X_t.iloc[:-n_forecast]
-            )
-        else:
-            self.selected_exog_ = []
-
-        exog_train = (
-            X_t[self.selected_exog_].iloc[:-n_forecast].values
-            if self.selected_exog_
-            else None
-        )
-        exog_test = (
-            X_t[self.selected_exog_].iloc[-n_forecast:].values
-            if self.selected_exog_
-            else None
-        )
-
-        # ── 5. Fit ARIMAX ─────────────────────────────────────────────────────
-        print("\n[4/5] Fitting ARIMAX model (auto-selecting p, d, q via AIC)...")
-        y_in = y_train_t.ffill().bfill().values
-
-        try:
-            model = pm.auto_arima(
-                y_in,
-                exogenous=exog_train,
-                seasonal=False,
-                stepwise=True,
-                information_criterion="aic",
-                max_p=5, max_q=5, max_d=2,
-                error_action="ignore",
-                suppress_warnings=True,
-            )
-        except Exception as e:
-            self._log(f"ARIMAX failed ({e}); retrying as pure ARIMA")
-            model = pm.auto_arima(
-                y_in, seasonal=False, stepwise=True,
-                max_p=5, max_q=5, max_d=2,
-                error_action="ignore", suppress_warnings=True,
-            )
-            exog_test        = None
-            self.selected_exog_ = []
-
-        self.model_ = model
-        self._log(f"Selected model: ARIMA{model.order}  |  AIC = {model.aic():.2f}")
-
-        # ── 6. Residual diagnostics ───────────────────────────────────────────
-        print("\n[5/5] Checking model residuals...")
-        self._checker.check_residuals(model)
-
-        # ── 7. Forecast + inverse-transform ───────────────────────────────────
-        fc_t, ci_t = model.predict(
-            n_periods=n_forecast,
-            exogenous=exog_test,
-            return_conf_int=True,
-        )
-        fc    = self._checker.inverse_transform(fc_t,        dep_info)
-        ci_lo = self._checker.inverse_transform(ci_t[:, 0],  dep_info)
-        ci_hi = self._checker.inverse_transform(ci_t[:, 1],  dep_info)
-        actuals = y.values[-n_forecast:]
-
-        # ── 8. Accuracy metrics ───────────────────────────────────────────────
-        mae  = mean_absolute_error(actuals, fc)
-        rmse = float(np.sqrt(mean_squared_error(actuals, fc)))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            mape = float(
-                np.mean(
-                    np.abs(np.where(actuals != 0, (actuals - fc) / actuals, 0.0))
-                ) * 100
-            )
-
-        print(f"\n  Accuracy on held-out {n_forecast} period(s):")
-        print(f"    MAE  : {mae:.4f}")
-        print(f"    RMSE : {rmse:.4f}")
-        print(f"    MAPE : {mape:.2f}%")
-
-        idx = y.index[-n_forecast:]
-        return ForecastResult(
-            forecast      = pd.Series(fc,    index=idx, name="ARIMAX_forecast"),
-            ci_lower      = pd.Series(ci_lo, index=idx, name="ci_lower"),
-            ci_upper      = pd.Series(ci_hi, index=idx, name="ci_upper"),
-            actuals       = pd.Series(actuals, index=idx, name="actuals"),
-            train_actuals = y.iloc[:-n_forecast],
-            order         = model.order,
-            aic           = model.aic(),
-            mae           = mae,
-            rmse          = rmse,
-            mape          = mape,
-            selected_exog   = list(self.selected_exog_),
-            exog_transforms = {
-                k: v for k, v in self.exog_transforms_.items()
-                if k in self.selected_exog_
-            },
-            dep_transform = dep_info,
-            n_forecast    = n_forecast,
-            model         = model,
-        )
+def _metrics_placeholder() -> None:
+    pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Optional ML comparison
+# Seasonal-naive baseline
 # ─────────────────────────────────────────────────────────────────────────────
 
-class MLForecaster:
-    """
-    Backtesting comparison using Random Forest or XGBoost.
+class SeasonalNaive(BaseForecaster):
+    """ŷ_{T+i} = y_{T+i-m}. With m=1 this is the plain random-walk naive forecast."""
+    uses_exog = False
 
-    Approach: supervised learning on lag features. Because this is a
-    backtesting scenario (we hold out the last N actuals), the lag
-    features for the test period are constructed from true prior values —
-    no recursive multi-step error accumulation.
-    """
+    def __init__(self, period: int = 1) -> None:
+        self.period = max(1, int(period))
+        self.name = "SeasonalNaive" if self.period > 1 else "Naive"
 
-    def __init__(self, verbose: bool = True) -> None:
+    def fit_predict(self, y_train, X_train, X_future, h) -> Forecast:
+        vals = pd.Series(y_train).astype(float).ffill().bfill().values
+        m = self.period if len(vals) >= self.period else 1
+        last = vals[-m:]
+        point = np.array([last[i % m] for i in range(h)], dtype=float)
+        return Forecast(point=point, meta={"period": m})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARIMAX / SARIMAX
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ARIMAXForecaster(BaseForecaster):
+    """
+    Auto-(S)ARIMAX with exogenous regressors.
+
+    Key behaviours:
+      • exogenous regressors passed via the correct ``X=`` keyword (pmdarima ≥ 2.0),
+      • exog kept in LEVELS (only the dependent variable is variance-transformed),
+      • seasonal SARIMAX enabled when a seasonal period is detected,
+      • the (p,d,q)(P,D,Q) order is searched once and cached; later calls (backtest
+        folds) refit that fixed order, which keeps a 10-variable run fast,
+      • late-starting exog are aligned by trimming the shared leading-NaN region.
+    """
+    uses_exog = True
+
+    def __init__(self, period: int = 1, reuse_order: bool = True, verbose: bool = True) -> None:
+        self.period = max(1, int(period))
+        self.reuse_order = reuse_order
         self.verbose = verbose
+        self.name = "ARIMAX"
+        self._checker = AssumptionChecker(verbose)
+        self._order: Optional[Tuple] = None
+        self._seasonal_order: Optional[Tuple] = None
 
-    def _log(self, msg: str) -> None:
-        if self.verbose:
-            print(f"  {msg}")
-
-    def _build_feature_matrix(
-        self,
-        y: pd.Series,
-        exog: Optional[pd.DataFrame],
-        n_lags: int,
-    ) -> pd.DataFrame:
-        df = pd.DataFrame({"y": y.values})
-        df["t_index"] = np.arange(len(df))  # monotonic time position; gives tree models trend awareness
-        for i in range(1, n_lags + 1):
-            df[f"lag_{i}"] = df["y"].shift(i)
-        if exog is not None and not exog.empty:
-            for col in exog.columns:
-                df[col] = exog[col].values
-        return df.dropna().reset_index(drop=True)
-
-    def fit_and_forecast(
-        self,
-        y: pd.Series,
-        exog: Optional[pd.DataFrame],
-        n_forecast: int,
-        method: str = "rf",
-    ) -> MLResult:
-        n_lags = max(1, min(5, len(y) - n_forecast - 2))
-        feat_df = self._build_feature_matrix(y, exog, n_lags)
-
-        exog_cols   = [c for c in feat_df.columns if c not in ["y"] and not c.startswith("lag_")]
-        feature_cols = [f"lag_{i}" for i in range(1, n_lags + 1)] + exog_cols
-
-        n_train = len(feat_df) - n_forecast
-        if n_train <= 0:
-            raise ValueError("Not enough data for ML forecaster after lag creation")
-
-        X_train = feat_df.iloc[:n_train][feature_cols].fillna(0)
-        y_train = feat_df.iloc[:n_train]["y"]
-        X_test  = feat_df.iloc[n_train:][feature_cols].fillna(0)
-
-        # ── choose estimator ──────────────────────────────────────────────────
-        if method == "xgb":
-            from xgboost import XGBRegressor   # raises ImportError if not installed
-            clf   = XGBRegressor(n_estimators=200, random_state=42, verbosity=0)
-            label = "XGBoost"
-        else:
-            from sklearn.ensemble import RandomForestRegressor
-            clf   = RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
-            label = "RandomForest"
-
-        clf.fit(X_train, y_train)
-        preds   = clf.predict(X_test)
-        actuals = y.values[-n_forecast:]
-
-        mae  = mean_absolute_error(actuals, preds)
-        rmse = float(np.sqrt(mean_squared_error(actuals, preds)))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            mape = float(
-                np.mean(
-                    np.abs(np.where(actuals != 0, (actuals - preds) / actuals, 0.0))
-                ) * 100
-            )
-
-        self._log(
-            f"{label}: MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%"
-        )
-
-        idx = y.index[-n_forecast:]
-        return MLResult(
-            method   = label,
-            forecast = pd.Series(preds,   index=idx, name=f"{label}_forecast"),
-            actuals  = pd.Series(actuals, index=idx, name="actuals"),
-            mae      = mae,
-            rmse     = rmse,
-            mape     = mape,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ETS (Exponential Smoothing) forecaster
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ETSForecaster:
-    """
-    Holt-Winters Exponential Smoothing (ETS) forecaster. Univariate only.
-
-    Auto-selects additive trend; attempts additive seasonality when the series
-    index has a detectable quarterly/monthly frequency and enough observations
-    (≥ 2 full cycles). Falls back to simpler configurations if fitting fails.
-    """
-
-    def __init__(self, verbose: bool = True) -> None:
-        self.verbose = verbose
-
-    def _log(self, msg: str) -> None:
-        if self.verbose:
-            print(f"  {msg}")
+    def reset_order(self) -> None:
+        self._order = None
+        self._seasonal_order = None
 
     @staticmethod
-    def _detect_period(index) -> Optional[int]:
-        """Return seasonal period inferred from a DatetimeIndex, or None."""
-        if not isinstance(index, pd.DatetimeIndex):
-            return None
-        freq = getattr(index, "freq", None)
-        if freq is None:
-            try:
-                freq = pd.infer_freq(index)
-            except Exception:
-                return None
-        if freq is None:
-            return None
-        fs = str(freq).upper()
-        if any(q in fs for q in ("Q", "QS", "QE")):
-            return 4
-        if any(m in fs for m in ("MS", "ME", "BMS", "BM")):
-            return 12
-        if fs.startswith("M"):
-            return 12
-        if "W" in fs:
-            return 52
-        return None
+    def _align(y: pd.Series, X: Optional[pd.DataFrame]):
+        """Trim the common leading-NaN region; interpolate internal gaps in exog."""
+        y = pd.Series(y).astype(float)
+        if X is None or X.empty:
+            return y.ffill().bfill(), None
+        X = X.astype(float)
+        joined = pd.concat([y.rename("__y__"), X], axis=1)
+        first_valid = joined.apply(lambda c: c.first_valid_index())
+        start = max([i for i in first_valid if i is not None], default=joined.index[0])
+        joined = joined.loc[start:]
+        y_a = joined["__y__"].interpolate().ffill().bfill()
+        X_a = joined.drop(columns="__y__").interpolate().ffill().bfill()
+        return y_a, X_a
 
-    def fit_and_forecast(
-        self,
-        y: pd.Series,
-        n_forecast: int,
-    ) -> MLResult:
+    def fit_predict(self, y_train, X_train, X_future, h) -> Forecast:
+        import pmdarima as pm
+
+        exog_cols = list(X_train.columns) if (X_train is not None and not X_train.empty) else []
+        y_aligned, X_aligned = self._align(y_train, X_train if exog_cols else None)
+
+        info = self._checker.choose_transform(y_aligned, self.name)
+        y_t = self._checker.apply(y_aligned, info).values
+        exog_tr = X_aligned[exog_cols].values if exog_cols else None
+        exog_fu = (
+            X_future[exog_cols].astype(float).values
+            if (exog_cols and X_future is not None and not X_future.empty)
+            else None
+        )
+
+        seasonal = self.period > 1 and len(y_t) >= 2 * self.period
+        model = None
+        try:
+            if self.reuse_order and self._order is not None:
+                model = pm.ARIMA(
+                    order=self._order,
+                    seasonal_order=self._seasonal_order or (0, 0, 0, 0),
+                    suppress_warnings=True,
+                )
+                with _silence():
+                    model.fit(y_t, X=exog_tr)
+            else:
+                with _silence():
+                    model = pm.auto_arima(
+                        y_t, X=exog_tr,
+                        seasonal=seasonal, m=self.period if seasonal else 1,
+                        stepwise=True, information_criterion="aicc",
+                        max_p=5, max_q=5, max_d=2, max_P=2, max_Q=2, max_D=1,
+                        error_action="ignore", suppress_warnings=True,
+                    )
+                self._order = model.order
+                self._seasonal_order = getattr(model, "seasonal_order", (0, 0, 0, 0))
+        except Exception:
+            # last-resort fallback: pure ARIMA, no exog
+            with _silence():
+                model = pm.auto_arima(
+                    y_t, seasonal=False, stepwise=True,
+                    max_p=5, max_q=5, max_d=2,
+                    error_action="ignore", suppress_warnings=True,
+                )
+            self._order = model.order
+            self._seasonal_order = (0, 0, 0, 0)
+            exog_fu = None
+            exog_cols = []
+
+        with _silence():
+            fc_t, ci_t = model.predict(n_periods=h, X=exog_fu, return_conf_int=True)
+
+        point = self._checker.inverse(np.asarray(fc_t), info)
+        ci_lo = self._checker.inverse(np.asarray(ci_t)[:, 0], info)
+        ci_hi = self._checker.inverse(np.asarray(ci_t)[:, 1], info)
+
+        diagnostics = self._checker.residual_diagnostics(model, self.period)
+        meta = {
+            "order": tuple(model.order),
+            "seasonal_order": tuple(getattr(model, "seasonal_order", (0, 0, 0, 0))),
+            "aic": float(model.aic()) if hasattr(model, "aic") else np.nan,
+            "selected_exog": list(exog_cols),
+            "transform": info.method,
+            "diagnostics": diagnostics,
+        }
+        return Forecast(point=point, ci_lower=ci_lo, ci_upper=ci_hi, meta=meta)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Supervised lag models (Random Forest / XGBoost / ElasticNet)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SupervisedLagForecaster(BaseForecaster):
+    """
+    Shared machinery for regression-on-lags models. Features for predicting y_t are
+    the y lags (y_{t-1}…y_{t-L}), the contemporaneous selected exog x_t (known at
+    forecast time, consistent with ARIMAX), and — only for models that can
+    extrapolate (linear) — a time index. Multi-step forecasts are recursive.
+    """
+    uses_exog = True
+    add_time_index: bool = False
+
+    def __init__(self, n_lags_max: int = 5, verbose: bool = True) -> None:
+        self.n_lags_max = n_lags_max
+        self.verbose = verbose
+
+    def _make_estimator(self):
+        raise NotImplementedError
+
+    def fit_predict(self, y_train, X_train, X_future, h) -> Forecast:
+        y = pd.Series(y_train).astype(float).reset_index(drop=True)
+        n = len(y)
+        n_lags = max(1, min(self.n_lags_max, n - h - 2))
+
+        exog_cols = list(X_train.columns) if (X_train is not None and not X_train.empty) else []
+        Xtr = (
+            X_train.reset_index(drop=True).astype(float)
+            if exog_cols else pd.DataFrame(index=range(n))
+        )
+        Xfu = (
+            X_future.reset_index(drop=True).astype(float)
+            if (exog_cols and X_future is not None and not X_future.empty) else None
+        )
+
+        rows, targets = [], []
+        for t in range(n_lags, n):
+            feat = [y.iloc[t - k] for k in range(1, n_lags + 1)]
+            if exog_cols:
+                feat += [Xtr[c].iloc[t] for c in exog_cols]
+            if self.add_time_index:
+                feat.append(t)
+            rows.append(feat)
+            targets.append(y.iloc[t])
+
+        feat_df = pd.DataFrame(rows).replace([np.inf, -np.inf], np.nan)
+        keep = feat_df.notna().all(axis=1).values
+        feat_df = feat_df[keep]
+        target_arr = np.asarray(targets)[keep]
+        if len(feat_df) < 3:
+            raise ValueError("not enough rows after lag construction")
+
+        est = self._make_estimator()
+        with _silence():
+            est.fit(feat_df.values, target_arr)
+
+        history = list(y.values)
+        preds = []
+        for i in range(h):
+            feat = [history[-k] for k in range(1, n_lags + 1)]
+            if exog_cols and Xfu is not None:
+                feat += [float(Xfu[c].iloc[i]) for c in exog_cols]
+            elif exog_cols:
+                feat += [float(Xtr[c].iloc[-1]) for c in exog_cols]
+            if self.add_time_index:
+                feat.append(n + i)
+            p = float(est.predict(np.array(feat).reshape(1, -1))[0])
+            preds.append(p)
+            history.append(p)
+
+        return Forecast(point=np.array(preds, dtype=float),
+                        meta={"selected_exog": exog_cols, "n_lags": n_lags})
+
+
+class RandomForestForecaster(_SupervisedLagForecaster):
+    name = "RandomForest"
+    add_time_index = False   # trees cannot extrapolate a time index — omit it
+
+    def _make_estimator(self):
+        from sklearn.ensemble import RandomForestRegressor
+        return RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
+
+
+class XGBoostForecaster(_SupervisedLagForecaster):
+    name = "XGBoost"
+    add_time_index = False
+
+    def _make_estimator(self):
+        from xgboost import XGBRegressor   # raises ImportError if unavailable
+        return XGBRegressor(n_estimators=300, max_depth=3, learning_rate=0.05,
+                            subsample=0.9, random_state=42, verbosity=0)
+
+
+class LinearLagForecaster(_SupervisedLagForecaster):
+    """ElasticNet on standardized lags + exog + time index. Linear → can extrapolate
+    a trend (unlike trees) and the L1/L2 penalty keeps it stable with many exog."""
+    name = "ElasticNet"
+    add_time_index = True
+
+    def _make_estimator(self):
+        from sklearn.linear_model import ElasticNetCV
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        return make_pipeline(
+            StandardScaler(),
+            ElasticNetCV(l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 1.0],
+                         cv=3, max_iter=5000, random_state=42),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Theta
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ThetaForecaster(BaseForecaster):
+    """statsmodels ThetaModel; deseasonalizes when a seasonal period is present."""
+    uses_exog = False
+    name = "Theta"
+
+    def __init__(self, period: int = 1, verbose: bool = True) -> None:
+        self.period = max(1, int(period))
+        self.verbose = verbose
+
+    def fit_predict(self, y_train, X_train, X_future, h) -> Forecast:
+        from statsmodels.tsa.forecasting.theta import ThetaModel
+
+        vals = pd.Series(pd.Series(y_train).astype(float).ffill().bfill().values)
+        deseason = self.period > 1 and len(vals) >= 2 * self.period
+        with _silence():
+            tm = ThetaModel(
+                vals,
+                period=self.period if deseason else None,
+                deseasonalize=deseason,
+            )
+            fit = tm.fit(disp=False)
+            preds = np.asarray(fit.forecast(h), dtype=float)
+        return Forecast(point=preds, meta={"deseasonalized": deseason})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ETS (Exponential Smoothing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ETSForecaster(BaseForecaster):
+    """
+    Holt-Winters / ETS. Searches a small grid of {trend, damped, seasonal} configs
+    and keeps the lowest-AICc fit. Damping is included so the trend cannot run away
+    into implausible jumps. Multiplicative options are tried only on positive data.
+    """
+    uses_exog = False
+    name = "ETS"
+
+    def __init__(self, period: int = 1, verbose: bool = True) -> None:
+        self.period = max(1, int(period))
+        self.verbose = verbose
+
+    def fit_predict(self, y_train, X_train, X_future, h) -> Forecast:
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-        y_train = y.iloc[:-n_forecast]
-        actuals = y.values[-n_forecast:]
+        vals = pd.Series(y_train).astype(float).ffill().bfill().values
+        positive = bool(np.all(vals > 0))
+        use_season = self.period > 1 and len(vals) >= 2 * self.period
 
-        period     = self._detect_period(y_train.index)
-        use_season = period is not None and len(y_train) >= 2 * period
-
-        # Try configurations from richest to simplest
-        configs = []
+        configs: List[Dict] = []
         if use_season:
-            configs.append({"trend": "add", "seasonal": "add", "seasonal_periods": period})
-        configs.append({"trend": "add", "seasonal": None, "seasonal_periods": None})
-        configs.append({"trend": None,  "seasonal": None, "seasonal_periods": None})
+            configs.append({"trend": "add", "damped_trend": True,  "seasonal": "add"})
+            configs.append({"trend": "add", "damped_trend": False, "seasonal": "add"})
+            if positive:
+                configs.append({"trend": "add", "damped_trend": True, "seasonal": "mul"})
+        configs.append({"trend": "add", "damped_trend": True,  "seasonal": None})
+        configs.append({"trend": "add", "damped_trend": False, "seasonal": None})
+        configs.append({"trend": None,  "damped_trend": False, "seasonal": None})
 
-        fit    = None
-        chosen = None
+        best_fit, best_cfg, best_aicc = None, None, np.inf
         for cfg in configs:
             try:
-                model = ExponentialSmoothing(
-                    y_train.values.astype(float),
-                    trend             = cfg["trend"],
-                    seasonal          = cfg["seasonal"],
-                    seasonal_periods  = cfg["seasonal_periods"],
-                    initialization_method = "estimated",
-                )
-                fit    = model.fit(optimized=True)
-                chosen = cfg
-                break
+                with _silence():
+                    fit = ExponentialSmoothing(
+                        vals,
+                        trend=cfg["trend"],
+                        damped_trend=cfg["damped_trend"],
+                        seasonal=cfg["seasonal"],
+                        seasonal_periods=self.period if cfg["seasonal"] else None,
+                        initialization_method="estimated",
+                    ).fit(optimized=True)
+                aicc = getattr(fit, "aicc", np.inf)
+                if np.isfinite(aicc) and aicc < best_aicc:
+                    best_fit, best_cfg, best_aicc = fit, cfg, aicc
             except Exception:
                 continue
 
-        if fit is None:
+        if best_fit is None:
             raise ValueError("ETS fitting failed under all configurations")
 
-        cfg_label = (
-            f"trend={chosen['trend']}, seasonal={chosen['seasonal']}"
-            + (f" period={chosen['seasonal_periods']}" if chosen["seasonal_periods"] else "")
-        )
-        self._log(f"ETS config: {cfg_label}")
-
-        preds = np.asarray(fit.forecast(n_forecast))
-
-        mae  = mean_absolute_error(actuals, preds)
-        rmse = float(np.sqrt(mean_squared_error(actuals, preds)))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            mape = float(
-                np.mean(
-                    np.abs(np.where(actuals != 0, (actuals - preds) / actuals, 0.0))
-                ) * 100
-            )
-
-        self._log(f"ETS: MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
-
-        idx = y.index[-n_forecast:]
-        return MLResult(
-            method   = "ETS",
-            forecast = pd.Series(preds, index=idx, name="ETS_forecast"),
-            actuals  = pd.Series(actuals, index=idx, name="actuals"),
-            mae      = mae,
-            rmse     = rmse,
-            mape     = mape,
-        )
+        with _silence():
+            preds = np.asarray(best_fit.forecast(h), dtype=float)
+        return Forecast(point=preds, meta={"config": best_cfg, "aicc": float(best_aicc)})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Theta forecaster
+# Model registry
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ThetaForecaster:
+def build_models(period: int = 1, verbose: bool = True) -> List[BaseForecaster]:
     """
-    Theta method — a weighted combination of two 'theta lines' derived from
-    simple exponential smoothing. Univariate only (ignores exog).
-
-    Uses statsmodels.tsa.forecasting.theta.ThetaModel with deseasonalize=False
-    so it works on any series regardless of frequency or index type.
+    The model roster. Add or remove a single line here to change which models run;
+    the orchestrators and the backtester pick them up automatically. The ensemble
+    is assembled separately in ``evaluation.py`` from these models' backtests.
     """
-
-    def __init__(self, verbose: bool = True) -> None:
-        self.verbose = verbose
-
-    def _log(self, msg: str) -> None:
-        if self.verbose:
-            print(f"  {msg}")
-
-    def fit_and_forecast(
-        self,
-        y: pd.Series,
-        n_forecast: int,
-    ) -> MLResult:
-        from statsmodels.tsa.forecasting.theta import ThetaModel
-
-        y_train = y.iloc[:-n_forecast]
-        actuals = y.values[-n_forecast:]
-
-        # Reset to integer index so ThetaModel doesn't need a DatetimeIndex
-        y_vals = pd.Series(y_train.values, dtype=float)
-        tm  = ThetaModel(y_vals, deseasonalize=False)
-        fit = tm.fit(disp=False)
-        preds = np.asarray(fit.forecast(n_forecast))
-
-        mae  = mean_absolute_error(actuals, preds)
-        rmse = float(np.sqrt(mean_squared_error(actuals, preds)))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            mape = float(
-                np.mean(
-                    np.abs(np.where(actuals != 0, (actuals - preds) / actuals, 0.0))
-                ) * 100
-            )
-
-        self._log(f"Theta: MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
-
-        idx = y.index[-n_forecast:]
-        return MLResult(
-            method   = "Theta",
-            forecast = pd.Series(preds, index=idx, name="Theta_forecast"),
-            actuals  = pd.Series(actuals, index=idx, name="actuals"),
-            mae      = mae,
-            rmse     = rmse,
-            mape     = mape,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model ranking utility
-# ─────────────────────────────────────────────────────────────────────────────
-
-def rank_models(
-    arimax: ForecastResult,
-    ml: List[MLResult],
-) -> List[Dict]:
-    """
-    Combine ARIMAX and ML results and sort by RMSE ascending (best = rank 1).
-
-    Each entry contains:
-        rank, label, forecast, ci_lower*, ci_upper*, mae, rmse, mape, is_arimax
-    (* ci_lower / ci_upper are None for ML models)
-    """
-    rows: List[Dict] = [
-        {
-            "label":    f"ARIMAX{arimax.order}",
-            "forecast": arimax.forecast,
-            "ci_lower": arimax.ci_lower,
-            "ci_upper": arimax.ci_upper,
-            "mae":      arimax.mae,
-            "rmse":     arimax.rmse,
-            "mape":     arimax.mape,
-            "is_arimax": True,
-        }
+    return [
+        SeasonalNaive(period=period),
+        ARIMAXForecaster(period=period, reuse_order=True, verbose=verbose),
+        RandomForestForecaster(verbose=verbose),
+        XGBoostForecaster(verbose=verbose),
+        ThetaForecaster(period=period, verbose=verbose),
+        ETSForecaster(period=period, verbose=verbose),
+        LinearLagForecaster(verbose=verbose),
     ]
-    for r in ml:
-        rows.append(
-            {
-                "label":    r.method,
-                "forecast": r.forecast,
-                "ci_lower": None,
-                "ci_upper": None,
-                "mae":      r.mae,
-                "rmse":     r.rmse,
-                "mape":     r.mape,
-                "is_arimax": False,
-            }
-        )
-    rows.sort(key=lambda x: x["rmse"])
-    for i, row in enumerate(rows):
-        row["rank"] = i + 1
-    return rows

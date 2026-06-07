@@ -1,334 +1,255 @@
 """
 exports.py
-Handles all output: Excel workbooks and PNG line charts.
+All output: Excel workbooks and PNG line charts. Consumes the ranked
+``VariableResult`` produced by ``evaluation.py``.
 
 Public classes
 ──────────────
 ForecastExporter      — single dependent-variable run (used by main.py)
 BatchForecastExporter — multi-variable batch run (used by batch_run.py)
 
-Module-level helpers
-────────────────────
-_ranked_models()      — build a ranked list (by RMSE) from ARIMAX + ML results
-_draw_forecast_chart()— populate a matplotlib Axes with the standard forecast chart
+Notes
+─────
+- Models are ranked by **backtest MASE** (lower is better); the best is marked ★.
+- The recent reported "actuals" are shown for reference but labelled UNRELIABLE —
+  they are not the ranking basis.
+- Chart filenames carry NO timestamp, so they stay stable across re-runs (a re-run
+  overwrites the prior chart of the same name). Excel keeps a timestamp so history
+  is preserved.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import matplotlib
-matplotlib.use("Agg")  # non-interactive; safe for scripts without a display
+matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from forecaster import ForecastResult, MLResult
+from evaluation import ModelEval, VariableResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ranked_models(
-    result: ForecastResult,
-    ml_results: Optional[List[MLResult]],
-) -> List[Dict]:
-    """
-    Build a flat list of all models sorted by RMSE ascending.
-
-    Each dict: label, forecast, ci_lower, ci_upper, mae, rmse, mape,
-               is_arimax, aic, order, rank.
-    """
-    rows: List[Dict] = [
-        {
-            "label":     f"ARIMAX{result.order}",
-            "forecast":  result.forecast,
-            "ci_lower":  result.ci_lower,
-            "ci_upper":  result.ci_upper,
-            "mae":       result.mae,
-            "rmse":      result.rmse,
-            "mape":      result.mape,
-            "is_arimax": True,
-            "aic":       result.aic,
-            "order":     str(result.order),
-        }
-    ]
-    for r in (ml_results or []):
-        rows.append(
-            {
-                "label":     r.method,
-                "forecast":  r.forecast,
-                "ci_lower":  None,
-                "ci_upper":  None,
-                "mae":       r.mae,
-                "rmse":      r.rmse,
-                "mape":      r.mape,
-                "is_arimax": False,
-                "aic":       "—",
-                "order":     "—",
-            }
-        )
-    rows.sort(key=lambda x: x["rmse"])
-    for i, row in enumerate(rows):
-        row["rank"] = i + 1
-    return rows
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)).strip("_") or "var"
 
 
-def _draw_forecast_chart(
-    ax,
-    result: ForecastResult,
-    ml_results: Optional[List[MLResult]],
-    dep_name: str,
-    time_name: str,
-) -> None:
-    """Populate a matplotlib Axes with the standard ranked forecast chart."""
-    ranked = _ranked_models(result, ml_results)
-    use_dates = pd.api.types.is_datetime64_any_dtype(result.forecast.index)
-
-    train = result.train_actuals
-    ax.plot(
-        train.index, train.values,
-        color="#2c7bb6", linewidth=1.5, label="Training data",
-    )
-
-    act = result.actuals
-    ax.plot(
-        act.index, act.values,
-        "o-", color="#1a9641", linewidth=1.5, markersize=5,
-        label=f"Actual (held-out, n={result.n_forecast})",
-    )
-
-    palette = ["#d7191c", "#f4a261", "#7b2d8b", "#00bcd4", "#2ca02c"]
-    for m, color in zip(ranked, palette):
-        is_best   = m["rank"] == 1
-        star      = "★ " if is_best else ""
-        linestyle = "-"  if is_best else "--"
-        marker    = "s"  if is_best else "^"
-        lw        = 2.0  if is_best else 1.4
-        label     = (
-            f"{star}{m['label']}  "
-            f"(MAE={m['mae']:.3f} | RMSE={m['rmse']:.3f} | MAPE={m['mape']:.1f}%)"
-        )
-        ax.plot(
-            m["forecast"].index, m["forecast"].values,
-            marker + linestyle, color=color,
-            linewidth=lw, markersize=5 if is_best else 4,
-            label=label, zorder=4 if is_best else 3,
-        )
-
-    ax.fill_between(
-        result.forecast.index,
-        result.ci_lower.values,
-        result.ci_upper.values,
-        alpha=0.12, color="#d7191c", label="ARIMAX 95% CI",
-    )
-
-    if len(train) > 0:
-        ax.axvline(train.index[-1], color="gray", linestyle=":", linewidth=1, alpha=0.6)
-
-    if use_dates:
-        ax.xaxis.set_major_formatter(
-            mdates.AutoDateFormatter(mdates.AutoDateLocator())
-        )
-
-    best = ranked[0]
-    ax.set_title(
-        f"Forecast — {dep_name}  |  Best fit: ★ {best['label']}"
-        f"  (RMSE={best['rmse']:.4f})",
-        fontsize=13, fontweight="bold",
-    )
-    ax.set_xlabel(time_name, fontsize=11)
-    ax.set_ylabel(dep_name,  fontsize=11)
-    ax.legend(loc="best", fontsize=9, framealpha=0.85)
-    ax.grid(True, alpha=0.25)
+def _label(m: ModelEval) -> str:
+    """Model display name with a leading ★ for the best and a ⚠ if any step is flagged."""
+    star = "★ " if m.rank == 1 else ""
+    warn = " ⚠" if any(f for f in m.flags) else ""
+    return f"{star}{m.name}{warn}"
 
 
-def _autofit_columns(ws) -> None:
-    for col_cells in ws.columns:
-        max_len = max(
-            (len(str(c.value)) for c in col_cells if c.value is not None),
-            default=10,
-        )
-        ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 60)
+def _find_ci(vr: VariableResult):
+    """Return (lower, upper) arrays from the best model that has a CI, else the
+    first model that does (typically ARIMAX); (None, None) if none."""
+    ordered = sorted(vr.models, key=lambda m: m.rank)
+    for m in ordered:
+        if m.final.ci_lower is not None and m.final.ci_upper is not None:
+            return m.name, np.asarray(m.final.ci_lower), np.asarray(m.final.ci_upper)
+    return None, None, None
 
 
-def _transform_detail(t) -> str:
-    """Human-readable detail string for a TransformInfo."""
-    if t.method == "boxcox":
-        return f"λ={t.lambda_:.4f}, shift={t.shift:.4f}"
-    if t.method in ("log", "sqrt", "pct_change") and t.shift != 0:
-        return f"shift={t.shift:.4f}"
-    if t.method == "diff":
-        return "—"
-    return "—"
+def _forecasts_df(vr: VariableResult) -> pd.DataFrame:
+    """Forecast table: one row per forecast period, one column per model (ranked)."""
+    data: Dict[str, object] = {
+        vr.time_col: list(vr.tail_index),
+        f"{vr.dep_col} (reported, UNRELIABLE)": vr.tail_actuals.values,
+    }
+    for m in vr.models:
+        data[f"{_label(m)}"] = np.asarray(m.final.point, dtype=float)
+    ci_name, lo, hi = _find_ci(vr)
+    if lo is not None:
+        data[f"{ci_name} CI Lower 95%"] = lo
+        data[f"{ci_name} CI Upper 95%"] = hi
+    best = vr.models[0]
+    data["Best-model flag"] = [f or "" for f in best.flags]
+    return pd.DataFrame(data)
 
 
-def _build_variables_df(result: ForecastResult, dep_name: str) -> pd.DataFrame:
-    """
-    Build the variable-metadata table for a single run:
-    one row for the dependent variable, one row per selected exogenous variable.
-    """
-    t = result.dep_transform
-    rows = [
-        {
-            "Variable":  dep_name,
-            "Role":      "Dependent",
-            "Transform": t.method,
-            "Detail":    _transform_detail(t),
-        }
-    ]
-    for v in result.selected_exog:
-        xt = result.exog_transforms.get(v)
-        rows.append(
-            {
-                "Variable":  v,
-                "Role":      "Exogenous (selected)",
-                "Transform": xt.method if xt else "—",
-                "Detail":    _transform_detail(xt) if xt else "—",
-            }
-        )
+def _metrics_df(vr: VariableResult) -> pd.DataFrame:
+    """Metrics table ranked by backtest MASE."""
+    rows = []
+    for m in vr.models:
+        meta = m.meta or {}
+        order = meta.get("order")
+        sorder = meta.get("seasonal_order")
+        order_str = "—"
+        if order is not None:
+            order_str = f"{tuple(order)}"
+            if sorder and any(sorder[:3]):
+                order_str += f"x{tuple(sorder)}"
+        rows.append({
+            "Rank": m.rank,
+            "Model": _label(m),
+            "MASE": _round(m.metrics.get("mase"), 3),
+            "sMAPE (%)": _round(m.metrics.get("smape"), 2),
+            "RMSE": _round(m.metrics.get("rmse"), 4),
+            "MAE": _round(m.metrics.get("mae"), 4),
+            "MAPE (%)": _round(m.metrics.get("mape"), 2),
+            "Order": order_str,
+            "AIC": _round(meta.get("aic"), 2) if isinstance(meta.get("aic"), (int, float)) else "—",
+            "Beats naive": "no" if (m.metrics.get("mase") or np.nan) >= 1 else "yes",
+            "Flagged": "yes" if any(f for f in m.flags) else "",
+        })
     return pd.DataFrame(rows)
 
 
+def _diagnostics_df(vr: VariableResult) -> pd.DataFrame:
+    """Variable metadata + ARIMAX residual diagnostics + run notes."""
+    rows = [
+        {"Item": "Dependent variable", "Value": vr.dep_col},
+        {"Item": "Seasonal period (m)", "Value": vr.period},
+        {"Item": "Selected exogenous", "Value": ", ".join(vr.selected_exog) or "none"},
+        {"Item": "Ranking basis", "Value": "rolling-origin backtest MASE on settled history"},
+        {"Item": "Recent actuals", "Value": "reported but UNRELIABLE (reporting lag) — excluded from ranking"},
+    ]
+    arimax = next((m for m in vr.models if m.name == "ARIMAX"), None)
+    if arimax is not None:
+        meta = arimax.meta or {}
+        diag = meta.get("diagnostics", {}) or {}
+        rows += [
+            {"Item": "ARIMAX transform", "Value": meta.get("transform", "—")},
+            {"Item": "ARIMAX Ljung-Box p (autocorr)", "Value": _round(diag.get("ljung_box_p"), 4)},
+            {"Item": "ARIMAX Shapiro p (normality)", "Value": _round(diag.get("normality_p"), 4)},
+            {"Item": "ARIMAX ARCH p (heterosked.)", "Value": _round(diag.get("arch_p"), 4)},
+            {"Item": "ARIMAX residual notes", "Value": diag.get("notes", "—")},
+        ]
+    return pd.DataFrame(rows)
+
+
+def _round(v, n):
+    try:
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return "—"
+        return round(float(v), n)
+    except Exception:
+        return "—"
+
+
+def _autofit(ws) -> None:
+    for col_cells in ws.columns:
+        max_len = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 60)
+
+
+def _draw_chart(ax, vr: VariableResult) -> None:
+    use_dates = pd.api.types.is_datetime64_any_dtype(pd.Index(vr.tail_index))
+
+    train = vr.train_actuals
+    ax.plot(train.index, train.values, color="#2c7bb6", linewidth=1.5, label="Settled history")
+
+    ax.plot(vr.tail_index, vr.tail_actuals.values, "o--", color="#7f7f7f",
+            linewidth=1.2, markersize=5, label="Reported (UNRELIABLE)")
+
+    palette = ["#d7191c", "#1a9641", "#f4a261", "#7b2d8b", "#00bcd4", "#2ca02c", "#e377c2", "#8c564b"]
+    for m, color in zip(vr.models, palette):
+        is_best = m.rank == 1
+        ax.plot(
+            vr.tail_index, m.final.point,
+            ("s-" if is_best else "^--"), color=color,
+            linewidth=2.0 if is_best else 1.3, markersize=6 if is_best else 4,
+            label=f"{_label(m)} (MASE={m.metrics.get('mase', float('nan')):.3f})",
+            zorder=5 if is_best else 3,
+        )
+
+    ci_name, lo, hi = _find_ci(vr)
+    if lo is not None:
+        ax.fill_between(vr.tail_index, lo, hi, alpha=0.12, color="#d7191c",
+                        label=f"{ci_name} 95% CI")
+
+    if len(train) > 0:
+        ax.axvline(train.index[-1], color="gray", linestyle=":", linewidth=1, alpha=0.6)
+    if use_dates:
+        ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(mdates.AutoDateLocator()))
+
+    best = vr.models[0]
+    ax.set_title(f"Forecast — {vr.dep_col}  |  Best: ★ {best.name}  (MASE={best.metrics.get('mase', float('nan')):.3f})",
+                 fontsize=13, fontweight="bold")
+    ax.set_xlabel(vr.time_col, fontsize=11)
+    ax.set_ylabel(vr.dep_col, fontsize=11)
+    ax.legend(loc="best", fontsize=8, framealpha=0.85)
+    ax.grid(True, alpha=0.25)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Single-run exporter  (used by main.py)
+# Single-run exporter (used by main.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ForecastExporter:
     """
-    Writes results to:
-      • "Estimates YYYY-MM-DD HH-MM-SS.xlsx"  — Forecasts / Metrics / Variables sheets
-      • "Estimates YYYY-MM-DD HH-MM-SS.png"   — line chart at DPI=300
-
-    All models are sorted by RMSE (best first) throughout every output.
-    The best-fit model is highlighted with a "★" prefix.
-    Both files are saved to output_dir (defaults to the source data directory).
+    Writes:
+      • "Estimates {dep} YYYY-MM-DD HH-MM-SS.xlsx"  — Forecasts / Metrics / Diagnostics
+      • "Estimates {dep}.png"                        — line chart (STABLE name, no timestamp)
     """
 
     def __init__(self, output_dir: str = ".") -> None:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        stamp     = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
-        self.stem = f"Estimates {stamp}"
+        self.stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
 
-    @property
-    def excel_path(self) -> Path:
-        return self.output_dir / f"{self.stem}.xlsx"
+    def excel_path(self, dep_col: str) -> Path:
+        return self.output_dir / f"Estimates {dep_col} {self.stamp}.xlsx"
 
-    @property
-    def chart_path(self) -> Path:
-        return self.output_dir / f"{self.stem}.png"
+    def chart_path(self, dep_col: str) -> Path:
+        # Stable name (no timestamp) so re-runs overwrite; "Estimates " prefix keeps
+        # it consistent with the Excel file and the project's .gitignore patterns.
+        return self.output_dir / f"Estimates {_safe_name(dep_col)}.png"
 
-    def export_excel(
-        self,
-        result: ForecastResult,
-        ml_results: Optional[List[MLResult]] = None,
-        dep_name: str = "y",
-        time_name: str = "time",
-    ) -> Path:
-        ranked = _ranked_models(result, ml_results)
+    def export_excel(self, vr: VariableResult) -> Path:
+        path = self.excel_path(vr.dep_col)
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            _forecasts_df(vr).to_excel(writer, sheet_name="Forecasts", index=False)
+            _autofit(writer.sheets["Forecasts"])
+            _metrics_df(vr).to_excel(writer, sheet_name="Metrics", index=False)
+            _autofit(writer.sheets["Metrics"])
+            _diagnostics_df(vr).to_excel(writer, sheet_name="Diagnostics", index=False)
+            _autofit(writer.sheets["Diagnostics"])
+        print(f"  Excel saved  →  {path}")
+        return path
 
-        with pd.ExcelWriter(self.excel_path, engine="openpyxl") as writer:
-
-            # Sheet 1: Forecasts
-            fc_data: Dict = {
-                time_name:              ranked[0]["forecast"].index,
-                f"{dep_name} (Actual)": result.actuals.values,
-            }
-            for m in ranked:
-                star = "★ " if m["rank"] == 1 else ""
-                fc_data[f"{star}{m['label']} Forecast"] = m["forecast"].values
-            fc_data["ARIMAX CI Lower 95%"] = result.ci_lower.values
-            fc_data["ARIMAX CI Upper 95%"] = result.ci_upper.values
-            pd.DataFrame(fc_data).to_excel(writer, sheet_name="Forecasts", index=False)
-            _autofit_columns(writer.sheets["Forecasts"])
-
-            # Sheet 2: Metrics
-            metric_rows = []
-            for m in ranked:
-                star = "★ " if m["rank"] == 1 else ""
-                metric_rows.append(
-                    {
-                        "Rank":     m["rank"],
-                        "Model":    f"{star}{m['label']}",
-                        "Order":    m["order"],
-                        "AIC":      round(m["aic"], 4) if isinstance(m["aic"], float) else m["aic"],
-                        "MAE":      round(m["mae"],  4),
-                        "RMSE":     round(m["rmse"], 4),
-                        "MAPE (%)": round(m["mape"], 2),
-                    }
-                )
-            pd.DataFrame(metric_rows).to_excel(writer, sheet_name="Metrics", index=False)
-            _autofit_columns(writer.sheets["Metrics"])
-
-            # Sheet 3: Variables
-            _build_variables_df(result, dep_name).to_excel(
-                writer, sheet_name="Variables", index=False
-            )
-            _autofit_columns(writer.sheets["Variables"])
-
-        print(f"  Excel saved  →  {self.excel_path}")
-        return self.excel_path
-
-    def export_chart(
-        self,
-        result: ForecastResult,
-        ml_results: Optional[List[MLResult]] = None,
-        dep_name: str = "y",
-        time_name: str = "time",
-    ) -> Path:
-        use_dates = pd.api.types.is_datetime64_any_dtype(result.forecast.index)
+    def export_chart(self, vr: VariableResult) -> Path:
+        use_dates = pd.api.types.is_datetime64_any_dtype(pd.Index(vr.tail_index))
         fig, ax = plt.subplots(figsize=(14, 6))
-        _draw_forecast_chart(ax, result, ml_results, dep_name, time_name)
+        _draw_chart(ax, vr)
         if use_dates:
             fig.autofmt_xdate()
         plt.tight_layout()
-        fig.savefig(self.chart_path, dpi=300, bbox_inches="tight")
+        path = self.chart_path(vr.dep_col)
+        fig.savefig(path, dpi=300, bbox_inches="tight")
         plt.close(fig)
-        print(f"  Chart saved  →  {self.chart_path}")
-        return self.chart_path
+        print(f"  Chart saved  →  {path}")
+        return path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Batch exporter  (used by batch_run.py)
+# Batch exporter (used by batch_run.py)
 # ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class _BatchRun:
-    dep_col:    str
-    time_col:   str
-    result:     ForecastResult
-    ml_results: List[MLResult]
-
 
 class BatchForecastExporter:
     """
-    Accumulates results across multiple dependent-variable runs, then writes:
-
-    Excel  →  {prefix}_{timestamp}.xlsx
-        • "Master Forecasts" — all variables, one row per forecast period,
-          with a leading "variable" column
-        • "Master Metrics"   — all models for all variables, ranked by RMSE,
-          with a leading "variable" column
-        • "FC — {var}"       — per-variable Forecasts sheet (same layout as
-          the single-run exporter, max 31 chars per sheet name)
-
-    Charts →  {prefix}_{var}_{timestamp}.png   (one per dependent variable)
+    Accumulates ``VariableResult``s, then writes:
+      Excel  →  {prefix}_{timestamp}.xlsx  (Master Forecasts, Master Metrics, per-var sheets)
+      Charts →  {prefix}_{var}.png         (one per variable, STABLE names, no timestamp)
     """
-
-    _ML_LABELS = ("RandomForest", "XGBoost", "Theta", "ETS")   # canonical ML model name prefixes
 
     def __init__(self, output_dir: str = ".", prefix: str = "batch_forecast") -> None:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        stamp      = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
-        self.stem  = f"{prefix}_{stamp}"
-        self._runs: List[_BatchRun] = []
+        self.prefix = prefix
+        self.stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+        self._runs: List[VariableResult] = []
 
     @property
     def has_results(self) -> bool:
@@ -336,160 +257,77 @@ class BatchForecastExporter:
 
     @property
     def excel_path(self) -> Path:
-        return self.output_dir / f"{self.stem}.xlsx"
+        return self.output_dir / f"{self.prefix}_{self.stamp}.xlsx"
 
     def chart_path(self, dep_col: str) -> Path:
-        safe = dep_col.replace("/", "-").replace("\\", "-")
-        return self.output_dir / f"{self.stem}_{safe}.png"
+        return self.output_dir / f"{self.prefix}_{_safe_name(dep_col)}.png"
 
-    def add_run(
-        self,
-        dep_col: str,
-        time_col: str,
-        result: ForecastResult,
-        ml_results: List[MLResult],
-    ) -> None:
-        self._runs.append(
-            _BatchRun(
-                dep_col=dep_col,
-                time_col=time_col,
-                result=result,
-                ml_results=ml_results,
-            )
-        )
-
-    # ── Excel ─────────────────────────────────────────────────────────────────
+    def add_run(self, vr: VariableResult) -> None:
+        self._runs.append(vr)
 
     def export_excel(self) -> Path:
-        master_fc_rows:  List[Dict] = []
-        master_met_rows: List[Dict] = []
-
+        master_fc: List[Dict] = []
+        master_met: List[Dict] = []
         with pd.ExcelWriter(self.excel_path, engine="openpyxl") as writer:
-
-            for run in self._runs:
-                result     = run.result
-                ml_results = run.ml_results
-                ranked     = _ranked_models(result, ml_results)
-                dep_col    = run.dep_col
-                time_col   = run.time_col
-
-                # ── Build ML forecast lookup {label_prefix: Series} ───────────
-                ml_fc: Dict[str, Optional[np.ndarray]] = {
-                    lbl: None for lbl in self._ML_LABELS
-                }
-                for r in ml_results:
-                    for lbl in self._ML_LABELS:
-                        if r.method.startswith(lbl):
-                            ml_fc[lbl] = r.forecast.values
-
-                best_label = ranked[0]["label"]
-
-                # ── Per-period rows for master forecast table ─────────────────
-                for i, idx_val in enumerate(result.forecast.index):
+            for vr in self._runs:
+                best = vr.models[0]
+                for i, idx_val in enumerate(vr.tail_index):
                     row: Dict = {
-                        "variable":         dep_col,
-                        time_col:           idx_val,
-                        "actual":           float(result.actuals.iloc[i]),
-                        "best_model":       best_label,
-                        "ARIMAX_forecast":  float(result.forecast.iloc[i]),
-                        "ARIMAX_CI_lower":  float(result.ci_lower.iloc[i]),
-                        "ARIMAX_CI_upper":  float(result.ci_upper.iloc[i]),
+                        "variable": vr.dep_col,
+                        vr.time_col: idx_val,
+                        "reported_actual_UNRELIABLE": float(vr.tail_actuals.iloc[i]),
+                        "best_model": best.name,
+                        "best_forecast": float(best.final.point[i]),
+                        "flag": best.flags[i] if i < len(best.flags) else "",
                     }
-                    for lbl in self._ML_LABELS:
-                        col_name = f"{lbl}_forecast"
-                        row[col_name] = (
-                            float(ml_fc[lbl][i]) if ml_fc[lbl] is not None else np.nan
-                        )
-                    master_fc_rows.append(row)
+                    for m in vr.models:
+                        row[m.name] = float(m.final.point[i])
+                    master_fc.append(row)
 
-                # ── Metric rows for master metrics table ──────────────────────
-                for m in ranked:
-                    star = "★ " if m["rank"] == 1 else ""
-                    master_met_rows.append(
-                        {
-                            "variable":  dep_col,
-                            "rank":      m["rank"],
-                            "model":     f"{star}{m['label']}",
-                            "order":     m["order"],
-                            "AIC":       round(m["aic"], 4) if isinstance(m["aic"], float) else m["aic"],
-                            "MAE":       round(m["mae"],  4),
-                            "RMSE":      round(m["rmse"], 4),
-                            "MAPE (%)":  round(m["mape"], 2),
-                        }
-                    )
+                met = _metrics_df(vr)
+                met.insert(0, "variable", vr.dep_col)
+                master_met.append(met)
 
-                # ── Per-variable Forecasts sheet ──────────────────────────────
-                fc_data: Dict = {
-                    time_col:              result.forecast.index,
-                    f"{dep_col} (Actual)": result.actuals.values,
-                }
-                for m in ranked:
-                    star = "★ " if m["rank"] == 1 else ""
-                    fc_data[f"{star}{m['label']} Forecast"] = m["forecast"].values
-                fc_data["ARIMAX CI Lower 95%"] = result.ci_lower.values
-                fc_data["ARIMAX CI Upper 95%"] = result.ci_upper.values
+                # per-variable sheet: forecasts, then diagnostics below
+                sheet = f"FC — {vr.dep_col}"[:31]
+                fdf = _forecasts_df(vr)
+                fdf.to_excel(writer, sheet_name=sheet, index=False)
+                ddf = _diagnostics_df(vr)
+                ddf.to_excel(writer, sheet_name=sheet, index=False, startrow=len(fdf) + 3)
+                _autofit(writer.sheets[sheet])
 
-                df_fc = pd.DataFrame(fc_data)
-                df_vars = _build_variables_df(result, dep_col)
+            if master_fc:
+                pd.DataFrame(master_fc).to_excel(writer, sheet_name="Master Forecasts", index=False)
+                _autofit(writer.sheets["Master Forecasts"])
+            if master_met:
+                pd.concat(master_met, ignore_index=True).to_excel(
+                    writer, sheet_name="Master Metrics", index=False)
+                _autofit(writer.sheets["Master Metrics"])
 
-                # Excel sheet names are capped at 31 characters
-                sheet_name = f"FC — {dep_col}"[:31]
-                # Write forecast table, then variables table two rows below
-                df_fc.to_excel(writer, sheet_name=sheet_name, index=False)
-                start_row = len(df_fc) + 3  # header + data rows + 2-row gap
-                df_vars.to_excel(
-                    writer, sheet_name=sheet_name, index=False, startrow=start_row
-                )
-                _autofit_columns(writer.sheets[sheet_name])
-
-            # ── Master Forecasts sheet (written first via sheet ordering) ─────
-            if master_fc_rows:
-                df_master = pd.DataFrame(master_fc_rows)
-                df_master.to_excel(
-                    writer, sheet_name="Master Forecasts", index=False
-                )
-                _autofit_columns(writer.sheets["Master Forecasts"])
-
-            # ── Master Metrics sheet ──────────────────────────────────────────
-            if master_met_rows:
-                df_met = pd.DataFrame(master_met_rows)
-                df_met.to_excel(
-                    writer, sheet_name="Master Metrics", index=False
-                )
-                _autofit_columns(writer.sheets["Master Metrics"])
-
-        # openpyxl writes sheets in insertion order; reorder so master sheets
-        # appear first (indices 0 and 1).
+        # reorder so master sheets come first (cosmetic)
         try:
             import openpyxl
             wb = openpyxl.load_workbook(self.excel_path)
-            names = wb.sheetnames
-            desired_first = [n for n in ("Master Forecasts", "Master Metrics") if n in names]
-            rest = [n for n in names if n not in desired_first]
-            wb._sheets = [wb[n] for n in desired_first + rest]
+            first = [n for n in ("Master Forecasts", "Master Metrics") if n in wb.sheetnames]
+            rest = [n for n in wb.sheetnames if n not in first]
+            wb._sheets = [wb[n] for n in first + rest]
             wb.save(self.excel_path)
         except Exception:
-            pass  # sheet ordering is cosmetic; don't fail the export
+            pass
 
         print(f"  Excel saved  →  {self.excel_path}")
         return self.excel_path
 
-    # ── Charts ────────────────────────────────────────────────────────────────
-
     def export_charts(self) -> List[Path]:
         paths: List[Path] = []
-        for run in self._runs:
-            use_dates = pd.api.types.is_datetime64_any_dtype(
-                run.result.forecast.index
-            )
+        for vr in self._runs:
+            use_dates = pd.api.types.is_datetime64_any_dtype(pd.Index(vr.tail_index))
             fig, ax = plt.subplots(figsize=(14, 6))
-            _draw_forecast_chart(
-                ax, run.result, run.ml_results, run.dep_col, run.time_col
-            )
+            _draw_chart(ax, vr)
             if use_dates:
                 fig.autofmt_xdate()
             plt.tight_layout()
-            p = self.chart_path(run.dep_col)
+            p = self.chart_path(vr.dep_col)
             fig.savefig(p, dpi=300, bbox_inches="tight")
             plt.close(fig)
             print(f"  Chart saved  →  {p}")

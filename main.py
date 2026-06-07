@@ -1,6 +1,7 @@
 """
 main.py
-Entry point — analyst-driven selections, then orchestrates the full pipeline.
+Entry point — analyst-driven selections, then runs the full pipeline for one
+dependent variable.
 
 Usage:
     python main.py
@@ -14,8 +15,9 @@ from typing import List, Optional
 
 import pandas as pd
 
+from evaluation import evaluate_variable
 from exports import ForecastExporter
-from forecaster import ARIMAXForecaster, ETSForecaster, MLForecaster, ThetaForecaster, rank_models
+from forecaster import detect_period
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,12 +26,11 @@ from forecaster import ARIMAXForecaster, ETSForecaster, MLForecaster, ThetaForec
 
 def _banner() -> None:
     print("=" * 62)
-    print("  autoARIMA  —  ARIMAX Time-Series Forecaster")
+    print("  autoARIMA  —  Multi-Model Time-Series Forecaster")
     print("=" * 62)
 
 
 def _pick_file() -> str:
-    """Open a native file-picker dialog; fall back to typed path."""
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -38,10 +39,7 @@ def _pick_file() -> str:
         root.wm_attributes("-topmost", True)
         path = filedialog.askopenfilename(
             title="Select data file",
-            filetypes=[
-                ("Excel / CSV", "*.xlsx *.xls *.csv"),
-                ("All files", "*.*"),
-            ],
+            filetypes=[("Excel / CSV", "*.xlsx *.xls *.csv"), ("All files", "*.*")],
         )
         root.destroy()
         return path
@@ -89,7 +87,7 @@ def _pick_column(df: pd.DataFrame, prompt: str, exclude: Optional[List[str]] = N
 
 def _pick_n(max_n: int) -> int:
     while True:
-        raw = input(f"\nNumber of periods to forecast/predict (1–{max_n}): ").strip()
+        raw = input(f"\nNumber of periods to forecast (1–{max_n}): ").strip()
         try:
             n = int(raw)
             if 1 <= n <= max_n:
@@ -99,6 +97,24 @@ def _pick_n(max_n: int) -> int:
         print(f"  Enter an integer between 1 and {max_n}.")
 
 
+def _pick_folds(max_folds: int, default: int) -> int:
+    """Number of rolling-origin backtest folds used to rank models. Press Enter
+    for the default. Folds control ranking robustness, not the forecast length."""
+    while True:
+        raw = input(
+            f"\nNumber of backtest folds for ranking (1–{max_folds}) [Enter for {default}]: "
+        ).strip()
+        if raw == "":
+            return default
+        try:
+            n = int(raw)
+            if 1 <= n <= max_folds:
+                return n
+        except ValueError:
+            pass
+        print(f"  Enter an integer between 1 and {max_folds} (or press Enter for {default}).")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,7 +122,6 @@ def _pick_n(max_n: int) -> int:
 def main() -> None:
     _banner()
 
-    # ── Step 1: load data ─────────────────────────────────────────────────────
     print("\nStep 1: Select data file")
     filepath = _pick_file()
     if not filepath:
@@ -118,112 +133,73 @@ def main() -> None:
     if df.empty:
         sys.exit("File is empty — exiting.")
 
-    # ── Step 2: time variable ─────────────────────────────────────────────────
     time_col = _pick_column(df, "Step 2: Select the TIME variable")
-    # Try to parse as datetime; keep as-is if it fails (e.g., integer years)
     try:
         df[time_col] = pd.to_datetime(df[time_col])
     except Exception:
         pass
-    df = df.sort_values(time_col).reset_index(drop=True)
-    df = df.set_index(time_col)
+    df = df.sort_values(time_col).reset_index(drop=True).set_index(time_col)
 
-    # ── Step 3: dependent variable ────────────────────────────────────────────
     dep_col = _pick_column(df, "Step 3: Select the DEPENDENT (target) variable")
 
-    # ── Step 4: number of periods to forecast ─────────────────────────────────
-    max_n = max(1, len(df) // 3)  # cap at 1/3 of data to ensure enough training
+    max_n = max(1, len(df) // 3)
     n_forecast = _pick_n(max_n)
-
     if len(df) - n_forecast < 10:
-        print(
-            f"\n  WARNING: only {len(df) - n_forecast} training observations after"
-            f" holding out {n_forecast}. Results may be unreliable."
-        )
+        print(f"\n  WARNING: only {len(df) - n_forecast} training observations after holding out "
+              f"{n_forecast}. Results may be unreliable.")
 
-    # ── ARIMAX pipeline ───────────────────────────────────────────────────────
+    period = detect_period(df.index)
+    print(f"\n  Seasonal period detected: {period}" + ("" if period > 1 else " (non-seasonal)"))
+
+    # How many rolling-origin backtest folds can the settled history support?
+    n_settled = len(df) - n_forecast
+    min_train = max(10, 2 * period, n_forecast + 2)
+    max_folds = max(1, n_settled - n_forecast - min_train + 1)
+    if max_folds <= 1:
+        n_folds = 1
+        print("  Backtest folds: 1 (limited by available history)")
+    else:
+        n_folds = _pick_folds(max_folds, default=min(3, max_folds))
+
     y = df[dep_col].astype(float)
     X = df.drop(columns=[dep_col]).select_dtypes(include="number")
-
     if X.empty:
-        print("\n  No numeric exogenous columns found — running as pure ARIMA.")
+        print("  No numeric exogenous columns found — univariate models only.")
 
     print("\n" + "=" * 62)
-    print("  Running ARIMAX pipeline")
+    print("  Running models (ranked by backtest MASE on settled history)")
     print("=" * 62)
 
-    forecaster = ARIMAXForecaster(verbose=True)
-    result     = forecaster.fit_and_forecast(y, X, n_forecast)
+    vr = evaluate_variable(
+        y=y, X=X, dep_col=dep_col, time_col=time_col,
+        n_forecast=n_forecast, period=period, n_folds=n_folds, verbose=True,
+    )
 
-    # ── ML comparison (always runs; XGBoost skipped gracefully if not installed) ──
-    exog_df = X[forecaster.selected_exog_] if forecaster.selected_exog_ else None
-    ml      = MLForecaster(verbose=True)
-    ml_results = []
-
-    print("\n" + "=" * 62)
-    print("  Running ML models")
-    print("=" * 62)
-
-    print("\n  Fitting Random Forest...")
-    try:
-        ml_results.append(ml.fit_and_forecast(y, exog_df, n_forecast, method="rf"))
-    except Exception as e:
-        print(f"  RandomForest failed: {e}")
-
-    print("\n  Fitting XGBoost...")
-    try:
-        ml_results.append(ml.fit_and_forecast(y, exog_df, n_forecast, method="xgb"))
-    except Exception as e:
-        ename = type(e).__name__
-        if "Import" in ename or "XGBoost" in ename or "libomp" in str(e):
-            print("  XGBoost unavailable — skipping.")
-            print("  Fix: pip install xgboost  (macOS: also run brew install libomp)")
-        else:
-            print(f"  XGBoost failed: {e}")
-
-    print("\n  Fitting Theta...")
-    try:
-        ml_results.append(ThetaForecaster(verbose=True).fit_and_forecast(y, n_forecast))
-    except Exception as e:
-        print(f"  Theta failed: {e}")
-
-    print("\n  Fitting ETS...")
-    try:
-        ml_results.append(ETSForecaster(verbose=True).fit_and_forecast(y, n_forecast))
-    except Exception as e:
-        print(f"  ETS failed: {e}")
-
-    # ── Rank all models by RMSE ───────────────────────────────────────────────
-    ranked = rank_models(result, ml_results)
-
-    # ── Export ────────────────────────────────────────────────────────────────
     print("\n" + "=" * 62)
     print("  Exporting results")
     print("=" * 62)
+    exporter = ForecastExporter(output_dir=str(Path(filepath).parent))
+    exporter.export_excel(vr)
+    exporter.export_chart(vr)
 
-    output_dir = Path(filepath).parent
-    exporter   = ForecastExporter(output_dir=str(output_dir))
-    exporter.export_excel(result, ml_results or None, dep_col, time_col)
-    exporter.export_chart(result, ml_results or None, dep_col, time_col)
-
-    # ── Ranked summary ────────────────────────────────────────────────────────
     print("\n" + "=" * 62)
-    print("  Model Rankings  (sorted by RMSE, best first)")
+    print("  Model Rankings  (sorted by backtest MASE, best first)")
     print("=" * 62)
-    print(f"  {'Rank':<6} {'Model':<22} {'MAE':>9} {'RMSE':>9} {'MAPE':>9}")
+    print(f"  {'Rank':<5} {'Model':<16} {'MASE':>7} {'sMAPE':>8} {'RMSE':>10}  Flags")
     print("  " + "-" * 60)
-    for m in ranked:
-        star = "★" if m["rank"] == 1 else " "
-        print(
-            f"  {star} #{m['rank']:<4} {m['label']:<22}"
-            f" {m['mae']:>9.4f} {m['rmse']:>9.4f} {m['mape']:>8.2f}%"
-        )
-    print(f"\n  Best fit: ★ {ranked[0]['label']}")
+    for m in vr.models:
+        star = "★" if m.rank == 1 else " "
+        flag = "⚠" if any(f for f in m.flags) else ""
+        print(f"  {star}#{m.rank:<3} {m.name:<16} {m.metrics['mase']:>7.3f} "
+              f"{m.metrics['smape']:>7.2f}% {m.metrics['rmse']:>10.3f}  {flag}")
+
+    best = vr.models[0]
+    print(f"\n  Best fit: ★ {best.name}  (MASE={best.metrics['mase']:.3f})")
     print(f"  Dependent variable : {dep_col}")
-    print(f"  Transform applied  : {result.dep_transform.method}")
-    print(f"  ARIMA order        : {result.order}")
-    print(f"  Exogenous used     : {result.selected_exog or 'none'}")
-    print(f"  Forecast periods   : {n_forecast}")
+    print(f"  Selected exogenous : {vr.selected_exog or 'none'}")
+    print(f"  Forecast periods   : {n_forecast}  (reported actuals shown but treated as UNRELIABLE)")
+    if any(f for f in best.flags):
+        print("  ⚠ Some forecast steps were flagged as large/implausible — see the chart & Excel flags.")
     print("\nDone.")
 
 
