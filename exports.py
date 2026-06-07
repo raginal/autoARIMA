@@ -61,14 +61,14 @@ def _forecasts_df(vr: VariableResult) -> pd.DataFrame:
     """Forecast table: one row per forecast period, one column per model (ranked)."""
     data: Dict[str, object] = {
         vr.time_col: list(vr.tail_index),
-        f"{vr.dep_col} (reported)": vr.tail_actuals.values,
+        f"{vr.dep_col} (reported)": [_round_forecast(v) for v in vr.tail_actuals.values],
     }
     for m in vr.models:
-        data[f"{_label(m)}"] = np.asarray(m.final.point, dtype=float)
+        data[f"{_label(m)}"] = [_round_forecast(v) for v in m.final.point]
     ci_name, lo, hi = _find_ci(vr)
     if lo is not None:
-        data[f"{ci_name} CI Lower 95%"] = lo
-        data[f"{ci_name} CI Upper 95%"] = hi
+        data[f"{ci_name} CI Lower 95%"] = [_round_forecast(v) for v in lo]
+        data[f"{ci_name} CI Upper 95%"] = [_round_forecast(v) for v in hi]
     best = vr.models[0]
     data["Implausible-jump flag"] = [f or "" for f in best.flags]
     return pd.DataFrame(data)
@@ -151,6 +151,22 @@ def _round(v, n):
         return round(float(v), n)
     except Exception:
         return "—"
+
+
+def _round_forecast(v):
+    """Display rounding for forecast/actual values: drop the decimals when they account
+    for less than 0.1% of the value (e.g. 123456.12 → 123456), otherwise keep two
+    decimals (e.g. 1.12 → 1.12)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v
+    if not np.isfinite(f) or f == 0:
+        return f
+    frac = abs(f - round(f))
+    if frac / abs(f) < 0.001:
+        return int(round(f))
+    return round(f, 2)
 
 
 def _autofit(ws) -> None:
@@ -287,13 +303,13 @@ class BatchForecastExporter:
                     row: Dict = {
                         "variable": vr.dep_col,
                         vr.time_col: idx_val,
-                        "reported": float(vr.tail_actuals.iloc[i]),
+                        "reported": _round_forecast(vr.tail_actuals.iloc[i]),
                         "best_model": best.name,
-                        "best_forecast": float(best.final.point[i]),
+                        "best_forecast": _round_forecast(best.final.point[i]),
                         "implausible_jump_flag": best.flags[i] if i < len(best.flags) else "",
                     }
                     for m in vr.models:
-                        row[m.name] = float(m.final.point[i])
+                        row[m.name] = _round_forecast(m.final.point[i])
                     master_fc.append(row)
 
                 met = _metrics_df(vr)

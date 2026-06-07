@@ -124,6 +124,10 @@ The **Implausible-jump flag** column is non-empty only when a forecast step jump
 3× the largest historical one-step move or leaves the historical range — it is advisory and
 blank when there is no concern.
 
+Forecast, reported and CI values are shown as whole numbers when the decimals account for
+less than 0.1% of the value (e.g. `123456.12` → `123456`); smaller values keep two decimals
+(e.g. `1.12`).
+
 ### Interactive mode (`main.py`)
 
 - **`Estimates {dep}.xlsx`**
@@ -216,6 +220,11 @@ autoARIMA/
 ---
 
 ## Changelog
+
+### 2026-06-07 — v2.5
+- **Magnitude-aware display rounding.** Forecast, reported and CI values are written as whole
+  numbers when the decimals are < 0.1% of the value (e.g. `123456.12` → `123456`); smaller
+  values keep two decimals (e.g. `1.12`).
 
 ### 2026-06-07 — v2.4
 - **Relevance-aware collinearity pruning.** When exogenous regressors are collinear (VIF > 10),
