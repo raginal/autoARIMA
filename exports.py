@@ -11,18 +11,14 @@ BatchForecastExporter — multi-variable batch run (used by batch_run.py)
 Notes
 ─────
 - Models are ranked by **backtest MASE** (lower is better); the best is marked ★.
-- The recent reported "actuals" are shown for reference but labelled UNRELIABLE —
-  they are not the ranking basis.
-- Chart filenames carry NO timestamp, so they stay stable across re-runs (a re-run
-  overwrites the prior chart of the same name). Excel keeps a timestamp so history
-  is preserved.
+- The recent reported actuals are shown for reference only — they are not the ranking basis.
+- Filenames carry NO timestamp, so outputs stay stable across re-runs: a re-run overwrites
+  the prior workbook and charts of the same name.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -65,7 +61,7 @@ def _forecasts_df(vr: VariableResult) -> pd.DataFrame:
     """Forecast table: one row per forecast period, one column per model (ranked)."""
     data: Dict[str, object] = {
         vr.time_col: list(vr.tail_index),
-        f"{vr.dep_col} (reported, UNRELIABLE)": vr.tail_actuals.values,
+        f"{vr.dep_col} (reported)": vr.tail_actuals.values,
     }
     for m in vr.models:
         data[f"{_label(m)}"] = np.asarray(m.final.point, dtype=float)
@@ -74,7 +70,7 @@ def _forecasts_df(vr: VariableResult) -> pd.DataFrame:
         data[f"{ci_name} CI Lower 95%"] = lo
         data[f"{ci_name} CI Upper 95%"] = hi
     best = vr.models[0]
-    data["Best-model flag"] = [f or "" for f in best.flags]
+    data["Implausible-jump flag"] = [f or "" for f in best.flags]
     return pd.DataFrame(data)
 
 
@@ -110,18 +106,26 @@ def _diagnostics_df(vr: VariableResult) -> pd.DataFrame:
     """Variable metadata + ARIMAX residual diagnostics + run notes."""
     rep = vr.selection_report or {}
     y_order = rep.get("_y_order")
+
+    def _exog_line(c, d):
+        s = f"{c}: I({d['order']}) r={d.get('spearman')}"
+        if d.get("coint_p") is not None:
+            s += f" coint_p={d['coint_p']}"
+        return s + f" [{d['basis']}]"
+
     exog_orders = "; ".join(
-        f"{c}: I({d['order']}) [{d['basis']}]"
-        for c, d in rep.items() if c != "_y_order"
+        _exog_line(c, d) for c, d in rep.items() if c != "_y_order"
     ) or "—"
     rows = [
         {"Item": "Dependent variable", "Value": vr.dep_col},
         {"Item": "Seasonal period (m)", "Value": vr.period},
         {"Item": "Dependent integration order", "Value": f"I({y_order})" if y_order is not None else "—"},
         {"Item": "Selected exogenous", "Value": ", ".join(vr.selected_exog) or "none"},
-        {"Item": "Exog stationarity & basis (spurious-reg guard)", "Value": exog_orders},
+        {"Item": "Exog: order, relevance (r on stationary basis), keep-basis", "Value": exog_orders},
         {"Item": "Ranking basis", "Value": "rolling-origin backtest MASE on settled history"},
-        {"Item": "Recent actuals", "Value": "reported but UNRELIABLE (reporting lag) — excluded from ranking"},
+        {"Item": "Recent actuals", "Value": "shown for reference; excluded from ranking (reporting lag)"},
+        {"Item": "Implausible-jump flag", "Value": "non-empty only when a forecast step jumps "
+            ">3× the largest historical move or leaves the historical range; blank = no concern"},
     ]
     arimax = next((m for m in vr.models if m.name == "ARIMAX"), None)
     if arimax is not None:
@@ -162,7 +166,7 @@ def _draw_chart(ax, vr: VariableResult) -> None:
     ax.plot(train.index, train.values, color="#2c7bb6", linewidth=1.5, label="Settled history")
 
     ax.plot(vr.tail_index, vr.tail_actuals.values, "o--", color="#7f7f7f",
-            linewidth=1.2, markersize=5, label="Reported (UNRELIABLE)")
+            linewidth=1.2, markersize=5, label="Reported")
 
     palette = ["#d7191c", "#1a9641", "#f4a261", "#7b2d8b", "#00bcd4", "#2ca02c", "#e377c2", "#8c564b"]
     for m, color in zip(vr.models, palette):
@@ -200,22 +204,19 @@ def _draw_chart(ax, vr: VariableResult) -> None:
 
 class ForecastExporter:
     """
-    Writes:
-      • "Estimates {dep} YYYY-MM-DD HH-MM-SS.xlsx"  — Forecasts / Metrics / Diagnostics
-      • "Estimates {dep}.png"                        — line chart (STABLE name, no timestamp)
+    Writes (stable names, no timestamp, so a re-run overwrites the prior output):
+      • "Estimates {dep}.xlsx"  — Forecasts / Metrics / Diagnostics
+      • "Estimates {dep}.png"   — line chart
     """
 
     def __init__(self, output_dir: str = ".") -> None:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
 
     def excel_path(self, dep_col: str) -> Path:
-        return self.output_dir / f"Estimates {dep_col} {self.stamp}.xlsx"
+        return self.output_dir / f"Estimates {_safe_name(dep_col)}.xlsx"
 
     def chart_path(self, dep_col: str) -> Path:
-        # Stable name (no timestamp) so re-runs overwrite; "Estimates " prefix keeps
-        # it consistent with the Excel file and the project's .gitignore patterns.
         return self.output_dir / f"Estimates {_safe_name(dep_col)}.png"
 
     def export_excel(self, vr: VariableResult) -> Path:
@@ -250,16 +251,16 @@ class ForecastExporter:
 
 class BatchForecastExporter:
     """
-    Accumulates ``VariableResult``s, then writes:
-      Excel  →  {prefix}_{timestamp}.xlsx  (Master Forecasts, Master Metrics, per-var sheets)
-      Charts →  {prefix}_{var}.png         (one per variable, STABLE names, no timestamp)
+    Accumulates ``VariableResult``s, then writes (stable names, no timestamp, so a re-run
+    overwrites the prior output):
+      Excel  →  {prefix}.xlsx       (Master Forecasts, Master Metrics, per-var sheets)
+      Charts →  {prefix}_{var}.png  (one per variable)
     """
 
     def __init__(self, output_dir: str = ".", prefix: str = "batch_forecast") -> None:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.prefix = prefix
-        self.stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
         self._runs: List[VariableResult] = []
 
     @property
@@ -268,7 +269,7 @@ class BatchForecastExporter:
 
     @property
     def excel_path(self) -> Path:
-        return self.output_dir / f"{self.prefix}_{self.stamp}.xlsx"
+        return self.output_dir / f"{self.prefix}.xlsx"
 
     def chart_path(self, dep_col: str) -> Path:
         return self.output_dir / f"{self.prefix}_{_safe_name(dep_col)}.png"
@@ -286,10 +287,10 @@ class BatchForecastExporter:
                     row: Dict = {
                         "variable": vr.dep_col,
                         vr.time_col: idx_val,
-                        "reported_actual_UNRELIABLE": float(vr.tail_actuals.iloc[i]),
+                        "reported": float(vr.tail_actuals.iloc[i]),
                         "best_model": best.name,
                         "best_forecast": float(best.final.point[i]),
-                        "flag": best.flags[i] if i < len(best.flags) else "",
+                        "implausible_jump_flag": best.flags[i] if i < len(best.flags) else "",
                     }
                     for m in vr.models:
                         row[m.name] = float(m.final.point[i])

@@ -284,7 +284,7 @@ class VariableSelector:
         max_vif: float = 10.0,
         max_exog: Optional[int] = None,
         min_coverage: float = 0.80,
-        coint_alpha: float = 0.01,   # strict: a levels relationship is rescued only on strong cointegration evidence
+        coint_alpha: float = 0.05,   # rescue a levels relationship on cointegration evidence
     ) -> List[str]:
         self.report_ = {}
         if X is None or X.empty:
@@ -363,7 +363,10 @@ class VariableSelector:
             self._log(f"Capping exogenous count {len(scored)} → {max_exog} (sample size guard)")
         selected = [c for c, _ in scored[:max_exog]]
 
-        # ── Step 4: VIF pruning with an intercept ──────────────────────────────
+        # ── Step 4: relevance-aware VIF pruning (with an intercept) ─────────────
+        # When regressors are collinear, drop the one LESS related to y, so a strong
+        # predictor is never discarded in favour of a weaker collinear partner.
+        relevance = dict(scored)
         while len(selected) > 1:
             sub = X[selected].dropna()
             if len(sub) <= len(selected) + 1:
@@ -378,8 +381,14 @@ class VariableSelector:
             mx = max(vifs)
             if mx <= max_vif:
                 break
-            drop_idx = vifs.index(mx)
-            self._log(f"{selected[drop_idx]}: VIF={mx:.2f} > {max_vif} → dropped (collinear)")
+            high = [i for i, v in enumerate(vifs) if v > max_vif]
+            drop_idx = min(high, key=lambda i: relevance.get(selected[i], 0.0))
+            self._log(
+                f"{selected[drop_idx]}: VIF={vifs[drop_idx]:.2f} > {max_vif}, "
+                f"least relevant of the collinear set → dropped"
+            )
+            if selected[drop_idx] in self.report_:
+                self.report_[selected[drop_idx]]["basis"] = "dropped (collinear)"
             selected.pop(drop_idx)
 
         self._log(f"Final exogenous selection: {selected or 'none'}")

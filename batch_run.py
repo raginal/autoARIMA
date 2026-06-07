@@ -46,7 +46,7 @@ N_FORECAST = 3                             # most-recent periods to forecast (th
 N_BACKTEST_FOLDS = 3                       # rolling-origin folds used for ranking
 
 EXPORT_DIR = None                          # None → same directory as DATA_FILE
-EXPORT_PREFIX = "batch_forecast"           # file stem; a timestamp is appended to the Excel file
+EXPORT_PREFIX = "batch_forecast"           # output file stem (stable; a re-run overwrites it)
 
 # ─────────────────────────────────────────────────────────────────────────────
 

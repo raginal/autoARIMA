@@ -117,32 +117,36 @@ and charts pick up the change automatically. Every model implements the same
 
 ## Outputs
 
-Charts have **stable filenames (no timestamp)**, so a re-run overwrites the previous
-chart of the same name. Excel files keep a timestamp so history is preserved.
+All filenames are **stable (no timestamp)**, so a re-run overwrites the previous output
+of the same name.
+
+The **Implausible-jump flag** column is non-empty only when a forecast step jumps more than
+3× the largest historical one-step move or leaves the historical range — it is advisory and
+blank when there is no concern.
 
 ### Interactive mode (`main.py`)
 
-- **`Estimates {dep} YYYY-MM-DD HH-MM-SS.xlsx`**
+- **`Estimates {dep}.xlsx`**
 
   | Sheet | Contents |
   |---|---|
-  | **Forecasts** | Period, reported actual (UNRELIABLE), every model's forecast (★ = best, ⚠ = flagged), best model's 95% CI, and a per-period flag column |
+  | **Forecasts** | Period, reported actual, every model's forecast (★ = best, ⚠ = flagged), best model's 95% CI, and the implausible-jump flag |
   | **Metrics** | Rank, MASE, sMAPE, RMSE, MAE, MAPE, ARIMA order, AIC, "Beats naive", "Flagged" — sorted by MASE |
-  | **Diagnostics** | Seasonal period, selected exogenous, ranking basis, and ARIMAX residual diagnostics (Ljung-Box, Shapiro-Wilk, ARCH) |
+  | **Diagnostics** | Seasonal period, dependent/exogenous integration orders + keep-basis, selected exogenous, ranking basis, flag legend, and ARIMAX residual diagnostics (Ljung-Box, Shapiro-Wilk, ARCH) |
 
-- **`Estimates {dep}.png`** — line chart (300 DPI): settled history, reported-but-unreliable tail (dashed grey), every model's forecast (best solid + ★), and the best model's 95% CI.
+- **`Estimates {dep}.png`** — line chart (300 DPI): settled history, reported tail (dashed grey), every model's forecast (best solid + ★), and the best model's 95% CI.
 
 ### Batch mode (`batch_run.py`)
 
-- **`{EXPORT_PREFIX}_{timestamp}.xlsx`**
+- **`{EXPORT_PREFIX}.xlsx`**
 
   | Sheet | Contents |
   |---|---|
-  | **Master Forecasts** | All variables; one row per forecast period; `variable`, `reported_actual_UNRELIABLE`, `best_model`, `best_forecast`, `flag`, and a column per model |
+  | **Master Forecasts** | All variables; one row per forecast period; `variable`, `reported`, `best_model`, `best_forecast`, `implausible_jump_flag`, and a column per model |
   | **Master Metrics** | All models for all variables; leading `variable` column; ranked by MASE within each variable |
   | **FC — {var}** | Per-variable forecast table (top) + diagnostics table (below) |
 
-- **`{EXPORT_PREFIX}_{var}.png`** — one chart per dependent variable (stable name).
+- **`{EXPORT_PREFIX}_{var}.png`** — one chart per dependent variable.
 
 ---
 
@@ -212,6 +216,19 @@ autoARIMA/
 ---
 
 ## Changelog
+
+### 2026-06-07 — v2.4
+- **Relevance-aware collinearity pruning.** When exogenous regressors are collinear (VIF > 10),
+  the selector now drops the one *less* correlated with the target instead of the highest-VIF one,
+  so a strong predictor is no longer discarded in favour of a weaker collinear partner.
+- **Cointegration rescue relaxed to the standard α=0.05** (from 0.01), so genuinely cointegrated
+  level relationships are retained rather than dropped as "spurious/weak" on short samples.
+- The Diagnostics sheet now shows each exog's relevance (`r` on the stationary basis) and
+  cointegration p-value, so it is clear why a variable was kept or dropped.
+- **Stable output filenames** — the Excel workbook no longer carries a timestamp (single-run
+  `Estimates {dep}.xlsx`, batch `{prefix}.xlsx`); a re-run overwrites it, matching the charts.
+- Renamed the reported-actual column to `reported`; renamed the forecast guardrail column to
+  `implausible_jump_flag` and documented it (blank = no concern) in the Diagnostics sheet.
 
 ### 2026-06-07 — v2.3
 - **ElasticNet robustness.** The linear lag model now differences its target to
