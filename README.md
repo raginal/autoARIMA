@@ -105,10 +105,10 @@ and charts pick up the change automatically. Every model implements the same
 | Model | Exog? | Notes |
 |---|---|---|
 | **SeasonalNaive** | no | Reference baseline and the MASE denominator. |
-| **ARIMAX (SARIMAX)** | yes | Auto `(p,d,q)(P,D,Q)` via AICc; seasonal when a period is detected; exogenous regressors via the correct `X=` keyword; exog kept in levels. |
+| **ARIMAX (SARIMAX)** | yes | Auto `(p,d,q)(P,D,Q)` via AICc; seasonal when a period is detected; exogenous regressors via the correct `X=` keyword; each exog linearized via a monotone Yeo-Johnson transform so the model's linearity assumption holds. |
 | **RandomForest** | yes | Lag + exog features, recursive multi-step. |
 | **XGBoost** | yes | As above (optional dependency). |
-| **ElasticNet** | yes | Standardised lags + exog + time index; linear, so it can extrapolate a trend and is robust to many exog. |
+| **ElasticNet** | yes | Standardised lags + exog; linear, so it can follow a trend and the L1/L2 penalty keeps it stable with many exog. The target is differenced to stationarity before fitting (so the regression is never run on integrated series) and the penalty is chosen by time-series cross-validation. |
 | **Theta** | no | `ThetaModel`, deseasonalised when a period is present. |
 | **ETS** | no | Holt-Winters; **damped** trend included and AICc-selected so the trend cannot run away. |
 | **Ensemble** | — | Inverse-MASE weighted combination of the strongest models. |
@@ -155,11 +155,13 @@ transform when warranted.
 | Concern | Test / handling |
 |---|---|
 | Variance stabilization (dependent var) | Box-Cox MLE λ → none / log / Box-Cox (inverse is domain-guarded, never `NaN`) |
+| Spurious regression | **Stationarity-aware selection:** the integration order of `y` and each exog is tested (KPSS), and relevance is measured by Spearman correlation on a **differenced (stationary) basis** — so unrelated integrated series don't correlate spuriously (cut the false-selection rate on random walks from ~66% to ~6%). A levels relationship is kept only when genuinely **cointegrated** (Engle-Granger, α=0.01). Estimation is separately safe: `auto_arima` differences an integrated `y` and SARIMAX applies that to the exog term (Δy on Δx). |
 | Exogenous relevance | **Spearman** rank correlation (catches monotonic non-linearity; invariant to a monotone transform of y) |
+| Exogenous→y linearity | Each selected exog is passed through a monotone **Yeo-Johnson** transform (λ chosen on the training slice to best linearize its relationship with y, then standardized), so SARIMAX's linear-in-exog assumption holds **without dropping** a strong non-linear driver. λ=1 (identity) is kept unless it meaningfully helps. |
 | Too many regressors | Cap at ≈ n/10 strongest by \|correlation\| |
 | Multicollinearity | VIF > 10 pruned **with an intercept** |
 | Late-starting exog | Dropped if coverage < 80% or missing over the forecast horizon; otherwise the shared leading-NaN region is trimmed |
-| Non-linearity / non-normality | Tree, ElasticNet and ensemble models capture non-linear effects; ranking is distribution-free (MASE on out-of-sample folds) |
+| Non-linearity / non-normality | Tree models (and the ensemble) capture non-linear effects; ranking is distribution-free (MASE on out-of-sample folds) |
 
 ### Residual diagnostics (post-fit, reported in the Excel **Diagnostics** sheet)
 
@@ -210,6 +212,35 @@ autoARIMA/
 ---
 
 ## Changelog
+
+### 2026-06-07 — v2.3
+- **ElasticNet robustness.** The linear lag model now differences its target to
+  stationarity (and the exog by the same order) before fitting, then integrates the
+  forecast back to levels — so it is never a regression on integrated series and follows
+  a trend through its drift term instead of shrinking toward the mean. The elastic-net
+  penalty is selected by time-series cross-validation (no shuffling). Tree models are
+  unchanged.
+- Removed dead code and comments that referenced earlier behaviour of the system.
+
+### 2026-06-07 — v2.2
+- **Spurious-regression guard.** Exogenous relevance is now judged on a stationary basis: the
+  integration order of `y` and each exog is tested (KPSS), and the Spearman correlation is computed
+  on the series differenced to a common order. This stops the selector from spuriously including
+  unrelated integrated series (false-selection rate on independent random walks fell from ~66% to
+  ~6%). A non-stationary pair is kept in levels only when genuinely cointegrated (Engle-Granger,
+  α=0.01). Each variable's integration order and keep-basis are written to the Excel Diagnostics
+  sheet. (Estimation was already safe — `auto_arima` differences an integrated `y` and SARIMAX
+  applies that differencing to the exog term, so the fitted coefficient is not spurious.)
+
+### 2026-06-07 — v2.1
+- **Exogenous linearization for ARIMAX:** each selected exog now passes through a monotone
+  Yeo-Johnson transform whose λ is fit on the training slice to best linearize its relationship
+  with `y` (then standardized). This honours SARIMAX's linear-in-exog assumption without dropping
+  strong non-linear-but-monotonic drivers, and one column per exog keeps the regressor cap intact.
+  The chosen λ per variable is recorded in the Excel **Diagnostics** sheet. As a side benefit, the
+  standardization improves numerical conditioning, lowering several variables' out-of-sample MASE.
+- `main.py` now prompts for the number of backtest folds (default 3); the forecast horizon and fold
+  count are fully user-driven and never hardcoded.
 
 ### 2026-06-07 — v2.0
 - **Critical fix:** ARIMAX now passes exogenous regressors via the correct `X=` keyword

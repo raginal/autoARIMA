@@ -35,7 +35,7 @@ from scipy import stats
 from scipy.special import inv_boxcox
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tools.tools import add_constant
-from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.tsa.stattools import coint
 
 
 @contextmanager
@@ -107,10 +107,8 @@ class AssumptionChecker:
     Handles the dependent variable's *variance-stabilizing* transform and the
     post-fit residual diagnostics.
 
-    Stationarity / differencing is intentionally NOT done here — SARIMAX selects
-    its own (d, D) integration orders. Pre-differencing the target fought that
-    selection and required fragile inverse-cumsum machinery, so this class now
-    only applies log / Box-Cox to stabilize variance when it helps.
+    Differencing is left to SARIMAX, which selects its own (d, D) integration orders;
+    this class only applies log / Box-Cox to stabilize variance when it helps.
     """
 
     MIN_OBS = 10
@@ -121,22 +119,6 @@ class AssumptionChecker:
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"    {msg}")
-
-    # ── stationarity test (informational / reused by VariableSelector) ─────────
-
-    def is_stationary(self, s: pd.Series) -> bool:
-        """ADF rejects unit root AND KPSS fails to reject stationarity (trend-aware)."""
-        s = pd.Series(s).dropna()
-        if len(s) < self.MIN_OBS:
-            return True
-        try:
-            with _silence():
-                adf_p = adfuller(s, autolag="AIC", regression="ct")[1]
-                nlags = max(1, min(int(len(s) ** 0.5), len(s) // 5))
-                kpss_p = kpss(s, regression="ct", nlags=nlags)[1]
-            return adf_p < 0.05 and kpss_p > 0.05
-        except Exception:
-            return False
 
     # ── dependent-variable transform ──────────────────────────────────────────
 
@@ -260,18 +242,38 @@ class VariableSelector:
     """
     Selects exogenous regressors via:
       1. Coverage + future-availability filter (handles late-starting series),
-      2. Spearman (rank) correlation filter — catches monotonic non-linear links
-         that Pearson misses and is invariant to a monotone transform of y,
+      2. **Stationarity-aware** Spearman relevance: y and each exog are differenced
+         to a common stationary order before correlating, so two unrelated integrated
+         series do not correlate spuriously (the classic spurious-regression trap).
+         A non-stationary pair is also kept if it is genuinely **cointegrated** — the
+         one case where a levels relationship is valid (Engle-Granger test).
       3. cap on the number of regressors (~n/10) to prevent over-parameterization,
       4. iterative VIF pruning (with an intercept) to remove collinear regressors.
+
+    After ``select`` runs, ``self.report_`` holds the per-exog integration order and the
+    basis on which each was kept/dropped (for the exported diagnostics).
     """
 
     def __init__(self, verbose: bool = True) -> None:
         self.verbose = verbose
+        self.report_: Dict[str, object] = {}
 
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"    {msg}")
+
+    @staticmethod
+    def _ndiffs(s: pd.Series, max_d: int = 2) -> int:
+        """Integration order via the KPSS unit-root test (same test auto_arima uses
+        for d). Returns 0 for a stationary series."""
+        s = pd.Series(s).dropna()
+        if len(s) < 12:
+            return 0
+        try:
+            from pmdarima.arima import ndiffs
+            return int(ndiffs(s.values, test="kpss", max_d=max_d))
+        except Exception:
+            return 0
 
     def select(
         self,
@@ -282,7 +284,9 @@ class VariableSelector:
         max_vif: float = 10.0,
         max_exog: Optional[int] = None,
         min_coverage: float = 0.80,
+        coint_alpha: float = 0.01,   # strict: a levels relationship is rescued only on strong cointegration evidence
     ) -> List[str]:
+        self.report_ = {}
         if X is None or X.empty:
             return []
 
@@ -290,7 +294,11 @@ class VariableSelector:
         if max_exog is None:
             max_exog = max(1, n // 10)
 
-        # ── Step 1+2: coverage, future-availability, Spearman correlation ──────
+        dy = self._ndiffs(y)
+        self.report_["_y_order"] = dy
+        self._log(f"dependent variable integration order: I({dy})")
+
+        # ── Step 1+2: coverage, future-availability, stationarity-aware relevance ─
         scored: List[Tuple[str, float]] = []
         for col in X.columns:
             try:
@@ -302,24 +310,54 @@ class VariableSelector:
                     self._log(f"{col}: dropped — only {cov:.0%} coverage (< {min_coverage:.0%})")
                     continue
                 pair = pd.concat([y, X[col]], axis=1).dropna()
-                if len(pair) < 5:
+                if len(pair) < 6:
                     continue
-                r = abs(float(stats.spearmanr(pair.iloc[:, 0], pair.iloc[:, 1]).statistic))
-                if not np.isfinite(r):
-                    continue
-                if r >= corr_threshold:
-                    scored.append((col, r))
-                    self._log(f"{col}: |Spearman|={r:.3f} → candidate")
+
+                dx = self._ndiffs(X[col])
+                d_common = max(dy, dx)
+                ys, xs = pair.iloc[:, 0], pair.iloc[:, 1]
+                if d_common > 0:
+                    diffed = pd.concat([ys.diff(d_common), xs.diff(d_common)], axis=1).dropna()
                 else:
-                    self._log(f"{col}: |Spearman|={r:.3f} → dropped (weak)")
+                    diffed = pd.concat([ys, xs], axis=1)
+                if len(diffed) < 5:
+                    continue
+                r = abs(float(stats.spearmanr(diffed.iloc[:, 0], diffed.iloc[:, 1]).statistic))
+                r = r if np.isfinite(r) else 0.0
+
+                keep = r >= corr_threshold
+                basis = ("differences" if d_common > 0 else "levels") if keep else "dropped"
+
+                # cointegration rescue: a genuine long-run levels relationship
+                coint_p = np.nan
+                if dy >= 1 and dx >= 1:
+                    try:
+                        with _silence():
+                            coint_p = float(coint(pair.iloc[:, 0], pair.iloc[:, 1])[1])
+                    except Exception:
+                        coint_p = np.nan
+                    if not keep and np.isfinite(coint_p) and coint_p < coint_alpha:
+                        keep, basis = True, "cointegration"
+
+                self.report_[col] = {
+                    "order": dx, "spearman": round(r, 3),
+                    "coint_p": (round(coint_p, 3) if np.isfinite(coint_p) else None),
+                    "basis": basis,
+                }
+                msg = f"{col}: I({dx}), |Spearman({'Δ' if d_common > 0 else 'lvl'})|={r:.3f}"
+                if np.isfinite(coint_p):
+                    msg += f", coint p={coint_p:.3f}"
+                self._log(msg + (f" → kept ({basis})" if keep else " → dropped (spurious/weak)"))
+                if keep:
+                    scored.append((col, max(r, corr_threshold) if basis == "cointegration" else r))
             except Exception:
                 continue
 
         if not scored:
-            self._log("No exogenous variable exceeds the correlation threshold — pure ARIMA")
+            self._log("No exogenous variable passes the stationarity-aware relevance test — pure ARIMA")
             return []
 
-        # ── Step 3: cap to the strongest max_exog by |correlation| ─────────────
+        # ── Step 3: cap to the strongest max_exog by relevance ─────────────────
         scored.sort(key=lambda t: t[1], reverse=True)
         if len(scored) > max_exog:
             self._log(f"Capping exogenous count {len(scored)} → {max_exog} (sample size guard)")
@@ -367,10 +405,6 @@ class BaseForecaster:
         raise NotImplementedError
 
 
-def _metrics_placeholder() -> None:
-    pass
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Seasonal-naive baseline
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,14 +434,22 @@ class ARIMAXForecaster(BaseForecaster):
     Auto-(S)ARIMAX with exogenous regressors.
 
     Key behaviours:
-      • exogenous regressors passed via the correct ``X=`` keyword (pmdarima ≥ 2.0),
-      • exog kept in LEVELS (only the dependent variable is variance-transformed),
+      • exogenous regressors passed via the ``X=`` keyword (pmdarima ≥ 2.0),
+      • each exog is passed through a monotone Yeo-Johnson transform whose λ is chosen
+        on the TRAINING slice to best linearize its relationship with y — this honours
+        SARIMAX's linear-in-exog assumption WITHOUT dropping a strong non-linear driver
+        (one column per exog, so no regressor blow-up). λ=1 (identity) is kept unless a
+        transform meaningfully improves linearity,
       • seasonal SARIMAX enabled when a seasonal period is detected,
       • the (p,d,q)(P,D,Q) order is searched once and cached; later calls (backtest
         folds) refit that fixed order, which keeps a 10-variable run fast,
       • late-starting exog are aligned by trimming the shared leading-NaN region.
     """
     uses_exog = True
+
+    # candidate Yeo-Johnson powers; 1.0 is the identity (no transform)
+    _YJ_LAMBDAS = np.array([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0])
+    _YJ_GAIN = 0.03   # adopt a non-identity λ only if it improves |corr| by at least this
 
     def __init__(self, period: int = 1, reuse_order: bool = True, verbose: bool = True) -> None:
         self.period = max(1, int(period))
@@ -437,6 +479,69 @@ class ARIMAXForecaster(BaseForecaster):
         X_a = joined.drop(columns="__y__").interpolate().ffill().bfill()
         return y_a, X_a
 
+    @staticmethod
+    def _yeojohnson(x: np.ndarray, lam: float) -> np.ndarray:
+        """Yeo-Johnson power transform (monotone increasing for every λ; defined for
+        negative, zero and positive values)."""
+        x = np.asarray(x, dtype=float)
+        out = np.empty_like(x)
+        pos = x >= 0
+        neg = ~pos
+        if lam != 0.0:
+            out[pos] = ((x[pos] + 1.0) ** lam - 1.0) / lam
+        else:
+            out[pos] = np.log1p(x[pos])
+        if (2.0 - lam) != 0.0:
+            out[neg] = -(((-x[neg] + 1.0) ** (2.0 - lam) - 1.0) / (2.0 - lam))
+        else:
+            out[neg] = -np.log1p(-x[neg])
+        return out
+
+    def _linearize_exog(self, Xtr_df, Xfu_df, y_t):
+        """
+        For each exogenous column, pick the Yeo-Johnson λ (on the TRAINING slice only)
+        that maximizes the linear correlation between the transformed exog and the
+        transformed y — i.e. the monotone transform that best linearizes the
+        relationship so SARIMAX's linear assumption holds. The same λ and the training
+        mean/std are applied to the forecast-horizon exog. Returns standardized arrays
+        (train, future) and the chosen λ per column.
+        """
+        y = np.asarray(y_t, dtype=float)
+        train_cols, fut_cols, lambdas = [], [], {}
+        for col in Xtr_df.columns:
+            xtr = Xtr_df[col].values.astype(float)
+            best_lam, best_abs, base_abs = 1.0, -1.0, None
+            for lam in self._YJ_LAMBDAS:
+                try:
+                    t = self._yeojohnson(xtr, lam)
+                    if not np.all(np.isfinite(t)) or np.std(t) == 0:
+                        continue
+                    r = abs(np.corrcoef(t, y)[0, 1])
+                except Exception:
+                    continue
+                if not np.isfinite(r):
+                    continue
+                if lam == 1.0:
+                    base_abs = r
+                if r > best_abs:
+                    best_abs, best_lam = r, lam
+            # keep identity unless a transform meaningfully improves linearity
+            if base_abs is not None and best_lam != 1.0 and (best_abs - base_abs) < self._YJ_GAIN:
+                best_lam = 1.0
+
+            t_tr = self._yeojohnson(xtr, best_lam)
+            mu, sd = float(np.mean(t_tr)), float(np.std(t_tr))
+            sd = sd if sd > 0 else 1.0
+            train_cols.append((t_tr - mu) / sd)
+            if Xfu_df is not None:
+                t_fu = self._yeojohnson(Xfu_df[col].values.astype(float), best_lam)
+                fut_cols.append((t_fu - mu) / sd)
+            lambdas[col] = round(float(best_lam), 2)
+
+        exog_tr = np.column_stack(train_cols) if train_cols else None
+        exog_fu = np.column_stack(fut_cols) if fut_cols else None
+        return exog_tr, exog_fu, lambdas
+
     def fit_predict(self, y_train, X_train, X_future, h) -> Forecast:
         import pmdarima as pm
 
@@ -445,12 +550,16 @@ class ARIMAXForecaster(BaseForecaster):
 
         info = self._checker.choose_transform(y_aligned, self.name)
         y_t = self._checker.apply(y_aligned, info).values
-        exog_tr = X_aligned[exog_cols].values if exog_cols else None
-        exog_fu = (
-            X_future[exog_cols].astype(float).values
-            if (exog_cols and X_future is not None and not X_future.empty)
-            else None
-        )
+
+        exog_lambdas: Dict[str, float] = {}
+        if exog_cols and X_future is not None and not X_future.empty:
+            exog_tr, exog_fu, exog_lambdas = self._linearize_exog(
+                X_aligned[exog_cols], X_future[exog_cols].astype(float), y_t
+            )
+        else:
+            # no usable forecast-horizon exog → fit without regressors
+            exog_tr = exog_fu = None
+            exog_cols = []
 
         seasonal = self.period > 1 and len(y_t) >= 2 * self.period
         model = None
@@ -486,6 +595,7 @@ class ARIMAXForecaster(BaseForecaster):
             self._seasonal_order = (0, 0, 0, 0)
             exog_fu = None
             exog_cols = []
+            exog_lambdas = {}
 
         with _silence():
             fc_t, ci_t = model.predict(n_periods=h, X=exog_fu, return_conf_int=True)
@@ -500,6 +610,7 @@ class ARIMAXForecaster(BaseForecaster):
             "seasonal_order": tuple(getattr(model, "seasonal_order", (0, 0, 0, 0))),
             "aic": float(model.aic()) if hasattr(model, "aic") else np.nan,
             "selected_exog": list(exog_cols),
+            "exog_lambdas": exog_lambdas,
             "transform": info.method,
             "diagnostics": diagnostics,
         }
@@ -512,13 +623,21 @@ class ARIMAXForecaster(BaseForecaster):
 
 class _SupervisedLagForecaster(BaseForecaster):
     """
-    Shared machinery for regression-on-lags models. Features for predicting y_t are
-    the y lags (y_{t-1}…y_{t-L}), the contemporaneous selected exog x_t (known at
-    forecast time, consistent with ARIMAX), and — only for models that can
-    extrapolate (linear) — a time index. Multi-step forecasts are recursive.
+    Shared machinery for regression-on-lags models. Features for predicting the target
+    at time t are its own lags (t-1…t-L), the contemporaneous selected exog, and —
+    only for models that can extrapolate (linear) — a time index. Multi-step forecasts
+    are recursive.
+
+    Models that set ``difference = True`` are first made stationary: the target is
+    differenced to its integration order (and the exog by the same order), the model is
+    fit on the differences, and the forecast is integrated back to levels. This keeps a
+    linear regression from running on integrated series (a spurious-regression trap) and
+    lets it follow a trend through the drift term instead of mean-reverting. Tree models
+    leave ``difference = False`` (they handle levels directly).
     """
     uses_exog = True
     add_time_index: bool = False
+    difference: bool = False
 
     def __init__(self, n_lags_max: int = 5, verbose: bool = True) -> None:
         self.n_lags_max = n_lags_max
@@ -527,30 +646,60 @@ class _SupervisedLagForecaster(BaseForecaster):
     def _make_estimator(self):
         raise NotImplementedError
 
+    @staticmethod
+    def _integrate(diff_forecast: np.ndarray, y_train: np.ndarray, d: int) -> np.ndarray:
+        """Invert d-th differencing: rebuild levels from forecast d-th differences,
+        seeding each integration with the last value of the corresponding lower-order
+        difference of the training series."""
+        cur = np.asarray(diff_forecast, dtype=float)
+        for k in range(d - 1, -1, -1):
+            seed = float(np.diff(y_train, n=k)[-1])
+            cur = seed + np.cumsum(cur)
+        return cur
+
     def fit_predict(self, y_train, X_train, X_future, h) -> Forecast:
         y = pd.Series(y_train).astype(float).reset_index(drop=True)
         n = len(y)
-        n_lags = max(1, min(self.n_lags_max, n - h - 2))
+        y_arr = y.values
 
         exog_cols = list(X_train.columns) if (X_train is not None and not X_train.empty) else []
-        Xtr = (
-            X_train.reset_index(drop=True).astype(float)
-            if exog_cols else pd.DataFrame(index=range(n))
-        )
-        Xfu = (
-            X_future.reset_index(drop=True).astype(float)
-            if (exog_cols and X_future is not None and not X_future.empty) else None
-        )
+        have_future = bool(exog_cols) and X_future is not None and not X_future.empty
+        if exog_cols and not have_future:
+            exog_cols = []     # cannot supply exog over the horizon → drop it
+        Xtr = X_train.reset_index(drop=True).astype(float) if exog_cols else None
+        Xfu = X_future.reset_index(drop=True).astype(float) if exog_cols else None
 
+        # integration order — only the linear model differences; trees stay on levels
+        d = 0
+        if self.difference and n > 14:
+            try:
+                from pmdarima.arima import ndiffs
+                d = int(ndiffs(y_arr, test="kpss", max_d=2))
+            except Exception:
+                d = 0
+        use_time = self.add_time_index and d == 0   # differenced model: intercept carries the drift
+
+        z = np.diff(y_arr, n=d) if d > 0 else y_arr.copy()
+        m = len(z)
+
+        # exog aligned to z (and over the horizon), differenced by the same order
+        exog_z: Dict[str, np.ndarray] = {}
+        exog_fu: Dict[str, np.ndarray] = {}
+        for c in exog_cols:
+            full = np.concatenate([Xtr[c].values, Xfu[c].values])
+            col_d = np.diff(full, n=d) if d > 0 else full
+            exog_z[c] = col_d[:m]
+            exog_fu[c] = col_d[-h:]
+
+        n_lags = max(1, min(self.n_lags_max, m - h - 2))
         rows, targets = [], []
-        for t in range(n_lags, n):
-            feat = [y.iloc[t - k] for k in range(1, n_lags + 1)]
-            if exog_cols:
-                feat += [Xtr[c].iloc[t] for c in exog_cols]
-            if self.add_time_index:
+        for t in range(n_lags, m):
+            feat = [z[t - k] for k in range(1, n_lags + 1)]
+            feat += [exog_z[c][t] for c in exog_cols]
+            if use_time:
                 feat.append(t)
             rows.append(feat)
-            targets.append(y.iloc[t])
+            targets.append(z[t])
 
         feat_df = pd.DataFrame(rows).replace([np.inf, -np.inf], np.nan)
         keep = feat_df.notna().all(axis=1).values
@@ -563,22 +712,20 @@ class _SupervisedLagForecaster(BaseForecaster):
         with _silence():
             est.fit(feat_df.values, target_arr)
 
-        history = list(y.values)
-        preds = []
+        history = list(z)
+        zhat = []
         for i in range(h):
             feat = [history[-k] for k in range(1, n_lags + 1)]
-            if exog_cols and Xfu is not None:
-                feat += [float(Xfu[c].iloc[i]) for c in exog_cols]
-            elif exog_cols:
-                feat += [float(Xtr[c].iloc[-1]) for c in exog_cols]
-            if self.add_time_index:
-                feat.append(n + i)
+            feat += [float(exog_fu[c][i]) for c in exog_cols]
+            if use_time:
+                feat.append(m + i)
             p = float(est.predict(np.array(feat).reshape(1, -1))[0])
-            preds.append(p)
+            zhat.append(p)
             history.append(p)
 
-        return Forecast(point=np.array(preds, dtype=float),
-                        meta={"selected_exog": exog_cols, "n_lags": n_lags})
+        point = self._integrate(np.array(zhat), y_arr, d) if d > 0 else np.array(zhat, dtype=float)
+        return Forecast(point=point,
+                        meta={"selected_exog": exog_cols, "n_lags": n_lags, "difference_order": d})
 
 
 class RandomForestForecaster(_SupervisedLagForecaster):
@@ -601,19 +748,26 @@ class XGBoostForecaster(_SupervisedLagForecaster):
 
 
 class LinearLagForecaster(_SupervisedLagForecaster):
-    """ElasticNet on standardized lags + exog + time index. Linear → can extrapolate
-    a trend (unlike trees) and the L1/L2 penalty keeps it stable with many exog."""
+    """
+    ElasticNet on standardized lags + exog. Linear → can follow a trend (unlike trees);
+    the L1/L2 penalty keeps it stable when lags/exog are collinear. The target is
+    differenced to stationarity before fitting (``difference = True``) so the regression
+    is not run on integrated series, and the elastic-net penalty is selected by
+    time-series cross-validation (no shuffling, train always precedes validation).
+    """
     name = "ElasticNet"
-    add_time_index = True
+    add_time_index = True   # used only when the series is already stationary (d == 0)
+    difference = True
 
     def _make_estimator(self):
         from sklearn.linear_model import ElasticNetCV
+        from sklearn.model_selection import TimeSeriesSplit
         from sklearn.pipeline import make_pipeline
         from sklearn.preprocessing import StandardScaler
         return make_pipeline(
             StandardScaler(),
             ElasticNetCV(l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 1.0],
-                         cv=3, max_iter=5000, random_state=42),
+                         cv=TimeSeriesSplit(n_splits=3), max_iter=5000, random_state=42),
         )
 
 

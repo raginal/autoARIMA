@@ -112,6 +112,7 @@ class VariableResult:
     train_actuals: pd.Series                 # settled history (for charts)
     models: List[ModelEval]                  # ranked, best first
     selected_exog: List[str] = field(default_factory=list)
+    selection_report: Dict = field(default_factory=dict)   # per-exog integration order + keep basis
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,9 +337,11 @@ def evaluate_variable(
 
     # ── exogenous selection (once, on settled training only) ───────────────────
     selected: List[str] = []
+    selection_report: Dict = {}
     if not settled_X.empty:
         selector = VariableSelector(verbose=verbose)
         selected = selector.select(settled_y, settled_X, X_future=future_X)
+        selection_report = selector.report_
     X_sel_settled = settled_X[selected] if selected else None
     X_sel_future = future_X[selected] if (selected and future_X is not None) else None
 
@@ -383,4 +386,5 @@ def evaluate_variable(
         dep_col=dep_col, time_col=time_col, period=period,
         tail_index=tail_index, tail_actuals=tail_actuals,
         train_actuals=settled_y, models=ranked, selected_exog=selected,
+        selection_report=selection_report,
     )

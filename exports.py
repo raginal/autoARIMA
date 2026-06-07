@@ -108,10 +108,18 @@ def _metrics_df(vr: VariableResult) -> pd.DataFrame:
 
 def _diagnostics_df(vr: VariableResult) -> pd.DataFrame:
     """Variable metadata + ARIMAX residual diagnostics + run notes."""
+    rep = vr.selection_report or {}
+    y_order = rep.get("_y_order")
+    exog_orders = "; ".join(
+        f"{c}: I({d['order']}) [{d['basis']}]"
+        for c, d in rep.items() if c != "_y_order"
+    ) or "—"
     rows = [
         {"Item": "Dependent variable", "Value": vr.dep_col},
         {"Item": "Seasonal period (m)", "Value": vr.period},
+        {"Item": "Dependent integration order", "Value": f"I({y_order})" if y_order is not None else "—"},
         {"Item": "Selected exogenous", "Value": ", ".join(vr.selected_exog) or "none"},
+        {"Item": "Exog stationarity & basis (spurious-reg guard)", "Value": exog_orders},
         {"Item": "Ranking basis", "Value": "rolling-origin backtest MASE on settled history"},
         {"Item": "Recent actuals", "Value": "reported but UNRELIABLE (reporting lag) — excluded from ranking"},
     ]
@@ -119,8 +127,11 @@ def _diagnostics_df(vr: VariableResult) -> pd.DataFrame:
     if arimax is not None:
         meta = arimax.meta or {}
         diag = meta.get("diagnostics", {}) or {}
+        lam = meta.get("exog_lambdas") or {}
+        lam_str = ", ".join(f"{k}: λ={v}" for k, v in lam.items()) or "—"
         rows += [
-            {"Item": "ARIMAX transform", "Value": meta.get("transform", "—")},
+            {"Item": "ARIMAX transform (y)", "Value": meta.get("transform", "—")},
+            {"Item": "ARIMAX exog linearization (Yeo-Johnson λ; 1=identity)", "Value": lam_str},
             {"Item": "ARIMAX Ljung-Box p (autocorr)", "Value": _round(diag.get("ljung_box_p"), 4)},
             {"Item": "ARIMAX Shapiro p (normality)", "Value": _round(diag.get("normality_p"), 4)},
             {"Item": "ARIMAX ARCH p (heterosked.)", "Value": _round(diag.get("arch_p"), 4)},
